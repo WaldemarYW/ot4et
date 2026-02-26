@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"
+  fill="#2B7A78" stroke="#2B7A78" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+  <!-- Pin head -->
+  <path d="M7 3h10l-3 6v3l3 3H7l3-3v-3L7 3z" />
+  <!-- Pin needle -->
+  <path d="M12 15v6" />
+</svg>

@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
+  <!-- Head (filled, larger) -->
+  <circle cx="12" cy="7" r="4" fill="#2B7A78"/>
+  <!-- Shoulders and chest (filled, larger) -->
+  <path d="M5 22v-2.5a6 6 0 0 1 6-6h2a6 6 0 0 1 6 6V22z" fill="#2B7A78"/>
+</svg>

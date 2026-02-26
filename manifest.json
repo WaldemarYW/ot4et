@@ -1,0 +1,41 @@
+{
+  "manifest_version": 3,
+  "name": "ОТ4ЕТ",
+  "version": "0.7.8.1",
+  "description": "Удобное ведение отчётов, быстрый доступ к истории, балансу и данным собеседников.",
+  "action": {
+    "default_title": "ОТ4ЕТ",
+    "default_icon": "icons/icon.png"
+  },
+  "icons": {
+    "16": "icons/icon.png",
+    "32": "icons/icon.png",
+    "48": "icons/icon.png",
+    "128": "icons/icon.png"
+  },
+  "permissions": ["storage", "activeTab", "webRequest", "contextMenus", "scripting"],
+  "host_permissions": [
+    "https://alpha.date/*",
+    "https://ot4et.pp.ua/*"
+  ],
+  "content_scripts": [
+    {
+      "matches": ["https://alpha.date/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "background": { "service_worker": "service_worker.js" },
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "icons/*",
+        "userInfoMenu.js",
+        "popup.js",
+        "monitorHooks.js",
+        "timezones.js"
+      ],
+      "matches": ["https://alpha.date/*"]
+    }
+  ]
+}

@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
+  <!-- Envelope -->
+  <rect x="3" y="5" width="18" height="14" rx="2"
+        fill="none" stroke="#2B7A78" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M3.5 7l8.5 6 8.5-6"
+        fill="none" stroke="#2B7A78" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+  <!-- Filled circle -->
+  <circle cx="18" cy="18" r="4.5" fill="#2B7A78"/>
+  <!-- White arrow -->
+  <line x1="18" y1="16" x2="18" y2="20" stroke="white" stroke-width="1.6" stroke-linecap="round"/>
+  <polyline points="16.5 18 18 20 19.5 18" fill="none" stroke="white" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

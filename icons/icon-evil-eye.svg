@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"
+  fill="none" stroke="#2B7A78" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+  <!-- Eye contour -->
+  <path d="M2.5 12c2.3-3 6-5 9.5-5s7.2 2 9.5 5c-2.3 3-6 5-9.5 5s-7.2-2-9.5-5z"/>
+  <!-- Iris -->
+  <circle cx="12" cy="12" r="3"/>
+  <!-- Pupil -->
+  <circle cx="12" cy="12" r="1" fill="#2B7A78" stroke="none"/>
+</svg>

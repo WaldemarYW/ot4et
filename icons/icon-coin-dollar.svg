@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
+  <!-- Outer coin circle -->
+  <circle cx="12" cy="12" r="9" fill="none" stroke="#e55252" stroke-width="2" />
+  <!-- Inner ring -->
+  <circle cx="12" cy="12" r="6" fill="none" stroke="#e55252" stroke-width="1.6" />
+  <!-- Dollar sign -->
+  <text x="12" y="15" text-anchor="middle"
+        font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif"
+        font-size="7" fill="#e55252" font-weight="600">$</text>
+</svg>

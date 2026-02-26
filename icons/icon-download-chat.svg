@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
+  <!-- Chat bubble -->
+  <path d="M4 5h16a1 1 0 0 1 1 1v8a2 2 0 0 1-2 2H8l-4 3v-3H5a2 2 0 0 1-2-2V6a1 1 0 0 1 1-1z"
+        fill="none" stroke="#2B7A78" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+  <!-- Filled circle -->
+  <circle cx="18" cy="18" r="4.5" fill="#2B7A78"/>
+  <!-- White arrow -->
+  <line x1="18" y1="16" x2="18" y2="20" stroke="white" stroke-width="1.6" stroke-linecap="round"/>
+  <polyline points="16.5 18 18 20 19.5 18" fill="none" stroke="white" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>
