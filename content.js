@@ -1273,6 +1273,82 @@ function setLettersOpenHotkey(next, options = {}) {
   }
 }
 
+function setSettingsProfileLookupStatus(message, tone = "muted") {
+  if (!ui?.settingsProfileLookupStatus) return;
+  const node = ui.settingsProfileLookupStatus;
+  const textValue = String(message || "").trim();
+  node.textContent = textValue;
+  node.classList.remove("muted", "error", "success");
+  node.classList.add(
+    tone === "error" ? "error" : tone === "success" ? "success" : "muted"
+  );
+}
+
+async function requestSettingsProfileByUserId() {
+  if (!ui?.settingsProfileUserIdInput || !ui?.settingsProfileLookupBtn) return;
+  const normalizedId = onlyDigits(ui.settingsProfileUserIdInput.value || "");
+  ui.settingsProfileUserIdInput.value = normalizedId;
+  if (!normalizedId) {
+    setSettingsProfileLookupStatus("Введите корректный user_id", "error");
+    return;
+  }
+  let token = "";
+  try {
+    const module = await loadUserInfoModule();
+    token = String(module?.getAuthToken?.() || "").trim();
+  } catch {}
+  if (!token) {
+    try {
+      token = String(window?.localStorage?.getItem?.("token") || "").trim();
+    } catch {}
+  }
+  if (!token) {
+    setSettingsProfileLookupStatus("Токен не найден", "error");
+    return;
+  }
+  ui.settingsProfileLookupBtn.disabled = true;
+  setSettingsProfileLookupStatus("Отправка запроса...", "muted");
+  try {
+    const url = new URL("https://alpha.date/api/operator/myProfile");
+    url.searchParams.set("user_id", normalizedId);
+    url.searchParams.set("activeProfile", "false");
+    const response = await fetch(url.toString(), {
+      method: "GET",
+      credentials: "include",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        accept: "application/json, text/plain, */*",
+      },
+    });
+    if (!response.ok) {
+      setSettingsProfileLookupStatus(`Ошибка ${response.status}`, "error");
+      toast(`myProfile: ошибка ${response.status}`);
+      return;
+    }
+    const payload = await response.json().catch(() => null);
+    const preview =
+      payload && typeof payload === "object"
+        ? String(
+            payload?.operator_name ||
+              payload?.name ||
+              payload?.username ||
+              payload?.id ||
+              "ok"
+          )
+        : "ok";
+    setSettingsProfileLookupStatus(`Успех: ${preview}`, "success");
+    try {
+      LOG.log("settings myProfile response", payload);
+      console.log("[OT4ET] myProfile response", payload);
+    } catch {}
+  } catch {
+    setSettingsProfileLookupStatus("Не удалось выполнить запрос", "error");
+    toast("myProfile: сервер недоступен");
+  } finally {
+    ui.settingsProfileLookupBtn.disabled = false;
+  }
+}
+
 function normalizeEventKeyForHotkey(event) {
   const key = String(event?.key || "").toLowerCase();
   if (!key) return "";
@@ -1555,52 +1631,9 @@ function isServerAccessLocked() {
 }
 
 function updateServerAccessUI() {
-  const locked = isServerAccessLocked();
   forEachLogoWhiteSquareCounterNode("operatorInfoTitle", (node) => {
-    node.textContent = locked ? "ВВЕДИТЕ ПАРОЛЬ ДОСТУПА!" : "Оператор";
+    node.textContent = "Оператор";
   });
-  const placeholderText = serverAuthChecking
-    ? "Проверка доступа"
-    : locked
-    ? "Пароль сервера"
-    : "Пароль подтвержден";
-  const applyNode = (node, fn) => {
-    if (!node) return;
-    try {
-      fn(node);
-    } catch {}
-  };
-  forEachLogoWhiteSquareCounterNode("operatorAuthInput", (node) => {
-    node.value = "";
-    node.placeholder = placeholderText;
-  });
-  forEachLogoWhiteSquareCounterNode("operatorAuthButton", (node) => {
-    node.disabled = serverAuthChecking;
-  });
-  const updateRoot = (root) => {
-    if (!root) return;
-    root.querySelectorAll(".menu-operator-auth-input").forEach((node) => {
-      node.value = "";
-      node.placeholder = placeholderText;
-    });
-    root
-      .querySelectorAll(".menu-operator-auth-btn")
-      .forEach((node) => (node.disabled = serverAuthChecking));
-    root
-      .querySelectorAll(".menu-operator-auth-row")
-      .forEach((node) => (node.style.display = "none"));
-  };
-  updateRoot(logoWhiteSquareMenuEl);
-  updateRoot(document);
-  updateRoot(shadow);
-  const applyMenuLockClass = (root) => {
-    if (!root) return;
-    root
-      .querySelectorAll(`.${LOGO_WHITE_SQUARE_MENU_CLASS}`)
-      .forEach((node) => node.classList.toggle("server-locked", locked));
-  };
-  applyMenuLockClass(document);
-  applyMenuLockClass(shadow);
 }
 
 function pulseServerAccessUI() {
@@ -2174,6 +2207,7 @@ function updateProfileInfoPopoverPosition() {
 }
 
 function createProfileInfoPopover(role = "") {
+  ensureProfileInfoStyles();
   const popover = document.createElement("div");
   popover.className = "ot4et-profile-popover";
   const title =
@@ -4412,6 +4446,372 @@ function initProfileSwitchInlineButton() {
   } catch {}
 }
 
+const CONNECT_COUNTRY_CONTENT_SELECTOR = '[class*="Connect_country_content__"]';
+const CONNECT_CHOOSE_MAN_ITEM_SELECTOR = '[class*="Connect_choose_man_item__"]';
+const CONNECT_BUTTONS_SELECTOR = '[class*="Connect_buttons__"]';
+const CONNECT_PERSONAL_LONG_NAME_SELECTOR = '[class*="Personal_personal_long_name__"]';
+const CONNECT_MAN_INFO_BUTTON_CLASS = "ot4et-connect-man-info-btn";
+const CONNECT_MAN_INFO_CONTAINER_CLASS = "ot4et-connect-man-info-container";
+const CONNECT_PERSONAL_INVITES_LIST_ENDPOINT =
+  "https://alpha.date/api/personal-invites/personal-invites-list";
+const CONNECT_MY_PROFILE_ENDPOINT = "https://alpha.date/api/operator/myProfile";
+const CONNECT_INVITES_CACHE_TTL_MS = 45 * 1000;
+const CONNECT_PROFILE_CACHE_TTL_MS = 4 * 60 * 1000;
+let connectInvitesCache = { expiresAt: 0, data: null };
+let connectInvitesInFlight = null;
+const connectProfileCache = new Map();
+const connectProfileInFlight = new Map();
+
+function parseConnectCardNameAge(itemEl) {
+  if (!itemEl) throw new Error("Карточка не найдена");
+  const nameNode = itemEl.querySelector(CONNECT_PERSONAL_LONG_NAME_SELECTOR);
+  if (!nameNode) throw new Error("Не удалось определить имя/возраст");
+  const parsed = parseNameAge(String(nameNode.textContent || "").trim());
+  const name = String(parsed?.name || "").trim();
+  const age = Number(parsed?.age);
+  if (!name || !Number.isFinite(age) || age <= 0) {
+    throw new Error("Не удалось определить имя/возраст");
+  }
+  return { name, age };
+}
+
+async function getAuthTokenForConnectInfo() {
+  let token = "";
+  try {
+    const module = await loadUserInfoModule();
+    token = String(module?.getAuthToken?.() || "").trim();
+  } catch {}
+  if (!token) {
+    try {
+      token = String(window?.localStorage?.getItem?.("token") || "").trim();
+    } catch {}
+  }
+  return token;
+}
+
+function getCurrentOperatorIdForConnectInfo(token) {
+  const fromState = toNumber(operatorInfoState?.operatorId);
+  if (Number.isFinite(fromState)) return fromState;
+  const payload = decodeJwt(token);
+  const fromToken = toNumber(payload?.operator_id) || toNumber(payload?.id);
+  if (Number.isFinite(fromToken)) return fromToken;
+  return null;
+}
+
+async function fetchPersonalInvitesList(token) {
+  const now = Date.now();
+  if (connectInvitesCache.data && connectInvitesCache.expiresAt > now) {
+    return connectInvitesCache.data;
+  }
+  if (connectInvitesInFlight) return connectInvitesInFlight;
+  connectInvitesInFlight = (async () => {
+    const data = await profileSwitchRequest({
+      url: CONNECT_PERSONAL_INVITES_LIST_ENDPOINT,
+      token,
+    });
+    connectInvitesCache = {
+      expiresAt: Date.now() + CONNECT_INVITES_CACHE_TTL_MS,
+      data: data || {},
+    };
+    return connectInvitesCache.data;
+  })();
+  try {
+    return await connectInvitesInFlight;
+  } finally {
+    connectInvitesInFlight = null;
+  }
+}
+
+function findInviteMatch({ invitesPayload, operatorId, name, age }) {
+  const list = Array.isArray(invitesPayload?.newList)
+    ? invitesPayload.newList
+    : Array.isArray(invitesPayload?.list)
+    ? invitesPayload.list
+    : [];
+  if (!list.length) throw new Error("Список инвайтов пуст");
+  const targetName = String(name || "").trim().toLowerCase();
+  const targetAge = Number(age);
+  const candidates = list.filter((invite) => {
+    const inviteOperatorId =
+      toNumber(invite?.operator_id) || toNumber(invite?.operatorId);
+    if (!Number.isFinite(inviteOperatorId) || inviteOperatorId !== operatorId) {
+      return false;
+    }
+    const aliasName = String(invite?.userProfileAlias?.name || "")
+      .trim()
+      .toLowerCase();
+    const aliasAge = Number(invite?.userProfileAlias?.age);
+    return aliasName === targetName && aliasAge === targetAge;
+  });
+  if (!candidates.length) throw new Error("Совпадение не найдено");
+  candidates.sort((a, b) => {
+    const timeA = new Date(a?.created_at || 0).getTime() || 0;
+    const timeB = new Date(b?.created_at || 0).getTime() || 0;
+    if (timeA !== timeB) return timeB - timeA;
+    const idA = toNumber(a?.id) || 0;
+    const idB = toNumber(b?.id) || 0;
+    return idB - idA;
+  });
+  return candidates[0] || null;
+}
+
+async function fetchMyProfileByUserId({ token, userId }) {
+  const key = String(userId || "").trim();
+  if (!key) throw new Error("Не найден man_external_id");
+  const cached = connectProfileCache.get(key);
+  const now = Date.now();
+  if (cached && cached.expiresAt > now) return cached.data;
+  if (connectProfileInFlight.has(key)) {
+    return connectProfileInFlight.get(key);
+  }
+  const requestPromise = (async () => {
+    const url = new URL(CONNECT_MY_PROFILE_ENDPOINT);
+    url.searchParams.set("user_id", key);
+    url.searchParams.set("activeProfile", "false");
+    const data = await profileSwitchRequest({
+      url: url.toString(),
+      token,
+    });
+    connectProfileCache.set(key, {
+      expiresAt: Date.now() + CONNECT_PROFILE_CACHE_TTL_MS,
+      data: data || {},
+    });
+    return data || {};
+  })();
+  connectProfileInFlight.set(key, requestPromise);
+  try {
+    return await requestPromise;
+  } finally {
+    connectProfileInFlight.delete(key);
+  }
+}
+
+function formatConnectLastOnline(value) {
+  const ts = Number(value);
+  if (!Number.isFinite(ts) || ts <= 0) return "";
+  const ms = ts < 1e12 ? ts * 1000 : ts;
+  const date = new Date(ms);
+  if (Number.isNaN(date.getTime())) return "";
+  return date.toLocaleString("ru-RU", {
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
+
+function openConnectInfoPopover(button, title) {
+  const popover = createProfileInfoPopover("man");
+  const titleNode = popover.querySelector(".ot4et-profile-popover-title");
+  if (titleNode) {
+    titleNode.textContent = String(title || "").trim() || "Информация о мужчине";
+  }
+  document.body.appendChild(popover);
+  positionProfileInfoPopover(popover, button);
+  currentProfilePopover = popover;
+  currentProfilePopoverButton = button;
+  button.classList.add("active");
+  currentProfilePopoverPositionHandler = updateProfileInfoPopoverPosition;
+  window.addEventListener("resize", currentProfilePopoverPositionHandler, {
+    passive: true,
+  });
+  window.addEventListener("scroll", currentProfilePopoverPositionHandler, {
+    passive: true,
+  });
+  setTimeout(() => {
+    document.addEventListener("click", handleOutsideClick);
+    document.addEventListener("keydown", handleEscapeKey);
+  }, 0);
+  return popover;
+}
+
+function renderConnectInfoPopoverError(popover, message) {
+  const content = popover?.querySelector(".ot4et-profile-popover-content");
+  if (!content) return;
+  content.innerHTML = `<div class="ot4et-profile-popover-error">${escapeHtml(
+    String(message || "Ошибка загрузки")
+  )}</div>`;
+}
+
+function renderConnectInfoPopover({
+  popover,
+  cardName,
+  cardAge,
+  manExternalId,
+  profileData,
+}) {
+  const content = popover?.querySelector(".ot4et-profile-popover-content");
+  if (!content) return;
+  const userInfo = profileData?.user_info || {};
+  const detail = userInfo?.user_detail || {};
+  const reference = userInfo?.user_reference || {};
+  const shortFields = [
+    ["ID", manExternalId],
+    ["Имя", detail?.name || cardName],
+    ["Возраст", detail?.age || cardAge],
+    ["Страна", detail?.country_name],
+    ["Город", reference?.city_name],
+    ["Онлайн", Number(detail?.online) === 1 ? "Да" : Number(detail?.online) === 0 ? "Нет" : ""],
+    ["Был онлайн", formatConnectLastOnline(detail?.last_online)],
+    ["Знак зодиака", reference?.zodiac],
+    ["Семейное положение", reference?.marital],
+    ["Дети", reference?.children],
+  ].filter((entry) => String(entry[1] ?? "").trim());
+  const summary = String(reference?.summary || "").trim();
+  const looking = String(reference?.looking || "").trim();
+  let html = "";
+  if (shortFields.length) {
+    html += `
+      <div class="ot4et-profile-popover-section">
+        <div class="ot4et-profile-popover-label">Кратко</div>
+        <div class="ot4et-profile-popover-text">${shortFields
+          .map(
+            ([label, value]) =>
+              `<div><strong>${escapeHtml(label)}:</strong> ${escapeHtml(String(value))}</div>`
+          )
+          .join("")}</div>
+      </div>
+    `;
+  }
+  if (summary) {
+    html += `
+      <div class="ot4et-profile-popover-section">
+        <div class="ot4et-profile-popover-label">Обо мне</div>
+        <div class="ot4et-profile-popover-text">${escapeHtml(summary)}</div>
+      </div>
+    `;
+  }
+  if (looking) {
+    html += `
+      <div class="ot4et-profile-popover-section">
+        <div class="ot4et-profile-popover-label">Ищу</div>
+        <div class="ot4et-profile-popover-text">${escapeHtml(looking)}</div>
+      </div>
+    `;
+  }
+  if (!html) {
+    html = '<div class="ot4et-profile-popover-empty">Нет информации</div>';
+  }
+  content.innerHTML = html;
+}
+
+async function handleConnectInfoButtonClick(event) {
+  event.preventDefault();
+  event.stopPropagation();
+  const button = event.currentTarget;
+  if (!button) return;
+  if (currentProfilePopoverButton === button && currentProfilePopover) {
+    closeProfileInfoPopover();
+    return;
+  }
+  const item = button.closest(CONNECT_CHOOSE_MAN_ITEM_SELECTOR);
+  let parsed = null;
+  try {
+    parsed = parseConnectCardNameAge(item);
+  } catch (err) {
+    closeProfileInfoPopover();
+    const fallbackPopover = openConnectInfoPopover(button, "Информация о мужчине");
+    renderConnectInfoPopoverError(
+      fallbackPopover,
+      err?.message || "Не удалось определить имя/возраст"
+    );
+    return;
+  }
+  closeProfileInfoPopover();
+  const popover = openConnectInfoPopover(button, `${parsed.name} ${parsed.age}`);
+  button.disabled = true;
+  button.style.opacity = "0.6";
+  button.setAttribute("aria-busy", "true");
+  try {
+    const token = await getAuthTokenForConnectInfo();
+    if (!token) throw new Error("Токен не найден");
+    const operatorId = getCurrentOperatorIdForConnectInfo(token);
+    if (!Number.isFinite(operatorId)) throw new Error("Не найден operator_id");
+    const invitesPayload = await fetchPersonalInvitesList(token);
+    const inviteMatch = findInviteMatch({
+      invitesPayload,
+      operatorId,
+      name: parsed.name,
+      age: parsed.age,
+    });
+    const manExternalId = String(
+      inviteMatch?.man_external_id || inviteMatch?.manExternalId || ""
+    ).trim();
+    if (!manExternalId) throw new Error("Не найден man_external_id");
+    const profileData = await fetchMyProfileByUserId({
+      token,
+      userId: manExternalId,
+    });
+    if (currentProfilePopover !== popover || currentProfilePopoverButton !== button) return;
+    renderConnectInfoPopover({
+      popover,
+      cardName: parsed.name,
+      cardAge: parsed.age,
+      manExternalId,
+      profileData,
+    });
+  } catch (err) {
+    if (currentProfilePopover !== popover || currentProfilePopoverButton !== button) return;
+    const rawMessage = String(err?.message || "").trim();
+    const message = /^HTTP\s+(\d+)/i.test(rawMessage)
+      ? `Ошибка ${rawMessage.match(/^HTTP\s+(\d+)/i)?.[1] || ""}`.trim()
+      : rawMessage || "Сервер недоступен";
+    renderConnectInfoPopoverError(popover, message);
+  } finally {
+    button.disabled = false;
+    button.style.opacity = "";
+    button.removeAttribute("aria-busy");
+  }
+}
+
+function createConnectManInfoButton() {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = CONNECT_MAN_INFO_BUTTON_CLASS;
+  button.textContent = "ℹ️";
+  button.title = "Информация";
+  button.setAttribute("aria-label", "Информация");
+  button.style.width = "28px";
+  button.style.height = "28px";
+  button.style.padding = "0";
+  button.style.margin = "0";
+  button.style.border = "1px solid rgba(31,79,116,0.28)";
+  button.style.borderRadius = "50%";
+  button.style.background = "rgba(255,255,255,0.96)";
+  button.style.cursor = "pointer";
+  button.style.display = "inline-flex";
+  button.style.alignItems = "center";
+  button.style.justifyContent = "center";
+  button.style.fontSize = "14px";
+  button.style.lineHeight = "1";
+  button.addEventListener("click", handleConnectInfoButtonClick);
+  return button;
+}
+
+function ensureConnectManInfoButtons() {
+  try {
+    const containers = document.querySelectorAll(CONNECT_COUNTRY_CONTENT_SELECTOR);
+    if (!containers?.length) return;
+    containers.forEach((container) => {
+      const items = container.querySelectorAll(CONNECT_CHOOSE_MAN_ITEM_SELECTOR);
+      items.forEach((item) => {
+        if (!item || item.querySelector(`.${CONNECT_MAN_INFO_CONTAINER_CLASS}`)) return;
+        const buttonsWrap = item.querySelector(CONNECT_BUTTONS_SELECTOR);
+        if (!buttonsWrap || !buttonsWrap.parentElement) return;
+        const infoWrap = document.createElement("div");
+        infoWrap.className = CONNECT_MAN_INFO_CONTAINER_CLASS;
+        infoWrap.style.display = "inline-flex";
+        infoWrap.style.alignItems = "center";
+        infoWrap.style.justifyContent = "center";
+        infoWrap.style.marginRight = "8px";
+        infoWrap.appendChild(createConnectManInfoButton());
+        buttonsWrap.parentElement.insertBefore(infoWrap, buttonsWrap);
+      });
+    });
+  } catch {}
+}
+
 function injectLogoWhiteSquareStyles() {
   try {
     if (document.getElementById(LOGO_WHITE_SQUARE_STYLE_ID)) return;
@@ -4757,59 +5157,6 @@ function injectLogoWhiteSquareStyles() {
       .${LOGO_WHITE_SQUARE_MENU_CLASS} .menu-operator-name-save.saved{
         background:#1f7a3d;
       }
-      .${LOGO_WHITE_SQUARE_MENU_CLASS} .menu-operator-auth-row{
-        display:none;
-        align-items:center;
-        gap:8px;
-        width:100%;
-        margin:4px 0 8px;
-      }
-      .${LOGO_WHITE_SQUARE_MENU_CLASS}.server-locked .menu-operator-auth-row{
-        display:flex;
-      }
-      .${LOGO_WHITE_SQUARE_MENU_CLASS}.server-locked .menu-section.menu-operator-info{
-        background:rgba(229, 82, 82, 0.06);
-        border:1px solid rgba(229, 82, 82, 0.25);
-      }
-      .${LOGO_WHITE_SQUARE_MENU_CLASS}.server-locked .menu-section.menu-operator-info .menu-title{
-        color:#e55252;
-      }
-      .${LOGO_WHITE_SQUARE_MENU_CLASS} .menu-operator-auth-input{
-        flex:1 1 auto;
-        min-width:0;
-        padding:6px 8px;
-        border:1px solid #d1d5e5;
-        border-radius:6px;
-        font-size:12px;
-        font-weight:600;
-        color:#0f2d4a;
-        background:#fff;
-      }
-      .${LOGO_WHITE_SQUARE_MENU_CLASS} .menu-operator-auth-btn{
-        flex:0 0 auto;
-        padding:6px 10px;
-        border-radius:6px;
-        border:none;
-        background:#0f2d4a;
-        color:#fff;
-        font-size:11px;
-        font-weight:700;
-        cursor:pointer;
-      }
-      .${LOGO_WHITE_SQUARE_MENU_CLASS} .menu-operator-auth-btn:disabled{
-        opacity:0.5;
-        cursor:default;
-      }
-      .${LOGO_WHITE_SQUARE_MENU_CLASS} .menu-operator-auth-status{
-        font-size:11px;
-        font-weight:600;
-        color:#6a7f91;
-        margin-left:auto;
-        white-space:nowrap;
-      }
-      .${LOGO_WHITE_SQUARE_MENU_CLASS}.server-locked [data-server-only="1"]{
-        display:none!important;
-      }
       .${LOGO_WHITE_SQUARE_MENU_CLASS} .menu-operator-info .menu-info-row{
         width:100%;
         justify-content:space-between;
@@ -5084,24 +5431,6 @@ function createLogoWhiteSquareMenuSections() {
   operatorNameRow.appendChild(operatorNameLabel);
   operatorNameLabel.hidden = true;
   operatorNameRow.appendChild(operatorNameControl);
-  const operatorAuthRow = document.createElement("div");
-  operatorAuthRow.className = "menu-row menu-operator-auth-row";
-  const operatorAuthInput = document.createElement("input");
-  operatorAuthInput.type = "password";
-  operatorAuthInput.className = "menu-operator-auth-input";
-  operatorAuthInput.placeholder = "Пароль сервера";
-  operatorAuthInput.autocomplete = "new-password";
-  operatorAuthInput.autocapitalize = "off";
-  operatorAuthInput.autocorrect = "off";
-  operatorAuthInput.inputMode = "text";
-  operatorAuthInput.spellcheck = false;
-  const operatorAuthButton = document.createElement("button");
-  operatorAuthButton.type = "button";
-  operatorAuthButton.className = "menu-operator-auth-btn";
-  operatorAuthButton.textContent = "Войти";
-  operatorAuthRow.appendChild(operatorAuthInput);
-  operatorAuthRow.appendChild(operatorAuthButton);
-  operatorAuthRow.style.display = "none";
   const operatorRow = document.createElement("div");
   operatorRow.className = "menu-row";
   const operatorLabel = document.createElement("span");
@@ -5113,7 +5442,6 @@ function createLogoWhiteSquareMenuSections() {
   operatorRow.appendChild(operatorValue);
   operatorSection.appendChild(operatorTitle);
   operatorSection.appendChild(operatorNameRow);
-  operatorSection.appendChild(operatorAuthRow);
   operatorSection.appendChild(operatorRow);
   const updateNameSaveState = () => {
     const current = String(operatorInfoState.operatorName || "").trim();
@@ -5153,27 +5481,6 @@ function createLogoWhiteSquareMenuSections() {
   });
   operatorNameSave.addEventListener("click", () => {
     commitOperatorName();
-  });
-  const updateAuthButtonState = () => {
-    operatorAuthButton.disabled = !String(operatorAuthInput.value || "").trim();
-  };
-  operatorAuthInput.addEventListener("input", updateAuthButtonState);
-  operatorAuthInput.addEventListener("keydown", (event) => {
-    if (event.key === "Enter") {
-      event.preventDefault();
-      operatorAuthButton.click();
-    }
-  });
-  operatorAuthButton.addEventListener("click", async () => {
-    const pwd = String(operatorAuthInput.value || "").trim();
-    if (!pwd) return;
-    const ok = await verifyServerAccessPassword(pwd);
-    if (!ok) {
-      toast("Неверный пароль");
-    } else {
-      toast("Доступ открыт");
-    }
-    updateAuthButtonState();
   });
   const totalDetails = document.createElement("div");
   totalDetails.className = "menu-info-list";
@@ -5256,8 +5563,6 @@ function createLogoWhiteSquareMenuSections() {
       operatorNameLabel,
       operatorNameInput,
       operatorNameSave,
-      operatorAuthInput,
-      operatorAuthButton,
       balanceSummaryValue: balanceValue,
       shiftTotalValue: shiftValue,
       shiftChatsValue: shiftChatRow.value,
@@ -6244,10 +6549,7 @@ function updateLogoWhiteSquareTexts() {
     setText("totalSectionTitle", "За смену");
     setText("hourSectionTitle", t("hourlyCount") || "За час");
     setText("profilesSectionTitle", t("profilesTitle") || "Анкеты");
-    setText(
-      "operatorInfoTitle",
-      isServerAccessLocked() ? "ВВЕДИТЕ ПАРОЛЬ ДОСТУПА!" : "Оператор"
-    );
+    setText("operatorInfoTitle", "Оператор");
     setText("operatorInfoLabel", t("operatorId") || "ID");
     const namePlaceholder = t("operatorNamePlaceholder") || "Имя";
     const nameSaveText = t("operatorNameSave") || "Сохранить";
@@ -9264,6 +9566,14 @@ function buildPanel() {
       .settings-row{display:flex;align-items:center;gap:8px;font-size:13px;cursor:pointer}
       .settings-row input{width:16px;height:16px;cursor:pointer}
       .settings-select{width:100%;max-width:100%;box-sizing:border-box;padding:6px 8px;border:1px solid var(--ar-border, ${PANEL_BORDER});border-radius:3px;background:var(--ar-bg, ${PANEL_BG});font:inherit;color:inherit}
+      .settings-search-row{display:flex;gap:8px;align-items:center;margin-top:6px}
+      .settings-search-row .settings-select{flex:1 1 auto}
+      .settings-search-btn{flex:0 0 auto;padding:6px 10px;border:1px solid #1f4f74;border-radius:3px;background:#1f4f74;color:#fff;font:inherit;font-size:12px;cursor:pointer}
+      .settings-search-btn:disabled{opacity:.6;cursor:default}
+      .settings-status{font-size:12px;line-height:1.3;min-height:16px}
+      .settings-status.muted{opacity:.7}
+      .settings-status.error{color:#c0392b}
+      .settings-status.success{color:#2d8a34}
       .user-info-menu{position:absolute;left:12px;right:12px;top:var(--user-info-menu-top, 60px);min-width:0;display:flex;flex-direction:column;gap:8px;padding:12px;border-radius:var(--ar-radius, 3px);border:1px solid var(--ar-border, ${PANEL_BORDER});background:var(--ar-elevated-bg, ${PANEL_ELEVATED_BG});box-shadow:0 10px 28px rgba(31,79,116,0.18);z-index:6}
       .user-info-menu::before{content:none}
       .user-info-menu[hidden]{display:none}
@@ -9343,6 +9653,14 @@ function buildPanel() {
               <span>Горячая клавиша открытия письма</span>
             </label>
             <input class="settings-select" id="lettersOpenHotkeyInput" type="text" placeholder="Горячая клавиша (например cmd+l)">
+            <label class="settings-row" for="settingsProfileUserIdInput">
+              <span>Поиск профиля по ID</span>
+            </label>
+            <div class="settings-search-row">
+              <input class="settings-select" id="settingsProfileUserIdInput" type="text" inputmode="numeric" autocomplete="off" placeholder="Введите user_id">
+              <button type="button" id="settingsProfileLookupBtn" class="settings-search-btn">Окей</button>
+            </div>
+            <div id="settingsProfileLookupStatus" class="settings-status muted"></div>
           </div>
         </div>
         <div class="row" id="row" style="display:none">
@@ -9441,6 +9759,9 @@ function buildPanel() {
     authModalError: shadow.getElementById("authModalError"),
     lettersNewWindowToggle: shadow.getElementById("lettersNewWindowToggle"),
     lettersOpenHotkeyInput: shadow.getElementById("lettersOpenHotkeyInput"),
+    settingsProfileUserIdInput: shadow.getElementById("settingsProfileUserIdInput"),
+    settingsProfileLookupBtn: shadow.getElementById("settingsProfileLookupBtn"),
+    settingsProfileLookupStatus: shadow.getElementById("settingsProfileLookupStatus"),
     profileSwitch: null,
     pin: shadow.getElementById("pin"),
     close: shadow.getElementById("close"),
@@ -12346,6 +12667,7 @@ const obs = new MutationObserver(() => {
   if (IS_SVG_DOCUMENT) return;
   applyModalState(getModalState(), { source: "mutation" });
   syncMediaBottomIcons();
+  ensureConnectManInfoButtons();
   if (!ui?.drawer?.classList?.contains("open")) return;
   scheduleContextRefresh();
 });
@@ -12387,6 +12709,7 @@ window.addEventListener("unload", () => {
   await loadExtensionLockState();
   buildPanel();
   syncMediaBottomIcons();
+  ensureConnectManInfoButtons();
   applyModalState(getModalState(), { source: "init" });
   const {
     lang,
@@ -12514,6 +12837,23 @@ window.addEventListener("unload", () => {
     });
     ui.lettersOpenHotkeyInput.addEventListener("blur", (event) => {
       setLettersOpenHotkey(event?.target?.value);
+    });
+  }
+  if (ui?.settingsProfileUserIdInput) {
+    ui.settingsProfileUserIdInput.addEventListener("input", (event) => {
+      const normalized = onlyDigits(event?.target?.value || "");
+      if (event?.target) event.target.value = normalized;
+    });
+    ui.settingsProfileUserIdInput.addEventListener("keydown", (event) => {
+      if (event.key === "Enter") {
+        event.preventDefault();
+        requestSettingsProfileByUserId();
+      }
+    });
+  }
+  if (ui?.settingsProfileLookupBtn) {
+    ui.settingsProfileLookupBtn.addEventListener("click", () => {
+      requestSettingsProfileByUserId();
     });
   }
   if (ui?.settingsBtn) {
