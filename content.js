@@ -4450,17 +4450,52 @@ const CONNECT_COUNTRY_CONTENT_SELECTOR = '[class*="Connect_country_content__"]';
 const CONNECT_CHOOSE_MAN_ITEM_SELECTOR = '[class*="Connect_choose_man_item__"]';
 const CONNECT_BUTTONS_SELECTOR = '[class*="Connect_buttons__"]';
 const CONNECT_PERSONAL_LONG_NAME_SELECTOR = '[class*="Personal_personal_long_name__"]';
+const CONNECT_MAN_ACTIONS_CONTAINER_CLASS = "ot4et-connect-man-actions-container";
 const CONNECT_MAN_INFO_BUTTON_CLASS = "ot4et-connect-man-info-btn";
 const CONNECT_MAN_INFO_CONTAINER_CLASS = "ot4et-connect-man-info-container";
+const CONNECT_MAN_TG_BUTTON_CLASS = "ot4et-connect-man-tg-btn";
+const CONNECT_MAN_TG_CONTAINER_CLASS = "ot4et-connect-man-tg-container";
 const CONNECT_PERSONAL_INVITES_LIST_ENDPOINT =
   "https://alpha.date/api/personal-invites/personal-invites-list";
 const CONNECT_MY_PROFILE_ENDPOINT = "https://alpha.date/api/operator/myProfile";
 const CONNECT_INVITES_CACHE_TTL_MS = 45 * 1000;
 const CONNECT_PROFILE_CACHE_TTL_MS = 4 * 60 * 1000;
+const CONNECT_TG_COUNT_CACHE_TTL_MS = 60 * 1000;
 let connectInvitesCache = { expiresAt: 0, data: null };
 let connectInvitesInFlight = null;
 const connectProfileCache = new Map();
 const connectProfileInFlight = new Map();
+const connectTgCountCache = new Map();
+const connectTgCountInFlight = new Map();
+
+function extractConnectInvitesList(payload) {
+  if (Array.isArray(payload?.newList)) return payload.newList;
+  if (Array.isArray(payload?.list)) return payload.list;
+  return [];
+}
+
+function isValidConnectProfilePayload(payload) {
+  if (!payload || typeof payload !== "object") return false;
+  const userInfo = payload?.user_info;
+  if (!userInfo || typeof userInfo !== "object") return false;
+  const detail = userInfo?.user_detail;
+  const reference = userInfo?.user_reference;
+  if (detail && typeof detail === "object") {
+    const hasAnyDetail =
+      String(detail?.external_id || "").trim() ||
+      String(detail?.name || "").trim() ||
+      Number.isFinite(Number(detail?.age));
+    if (hasAnyDetail) return true;
+  }
+  if (reference && typeof reference === "object") {
+    const hasAnyReference =
+      String(reference?.summary || "").trim() ||
+      String(reference?.looking || "").trim() ||
+      String(reference?.city_name || "").trim();
+    if (hasAnyReference) return true;
+  }
+  return false;
+}
 
 function parseConnectCardNameAge(itemEl) {
   if (!itemEl) throw new Error("Карточка не найдена");
@@ -4505,15 +4540,28 @@ async function fetchPersonalInvitesList(token) {
   }
   if (connectInvitesInFlight) return connectInvitesInFlight;
   connectInvitesInFlight = (async () => {
-    const data = await profileSwitchRequest({
-      url: CONNECT_PERSONAL_INVITES_LIST_ENDPOINT,
-      token,
-    });
-    connectInvitesCache = {
-      expiresAt: Date.now() + CONNECT_INVITES_CACHE_TTL_MS,
-      data: data || {},
-    };
-    return connectInvitesCache.data;
+    const requestOnce = async () =>
+      await profileSwitchRequest({
+        url: CONNECT_PERSONAL_INVITES_LIST_ENDPOINT,
+        token,
+      });
+    let data = await requestOnce();
+    let list = extractConnectInvitesList(data);
+    // API иногда отдаёт временно пустой список; делаем повтор.
+    if (!list.length) {
+      await new Promise((resolve) => setTimeout(resolve, 250));
+      data = await requestOnce();
+      list = extractConnectInvitesList(data);
+    }
+    if (list.length) {
+      connectInvitesCache = {
+        expiresAt: Date.now() + CONNECT_INVITES_CACHE_TTL_MS,
+        data: data || {},
+      };
+      return connectInvitesCache.data;
+    }
+    connectInvitesCache = { expiresAt: 0, data: null };
+    return data || {};
   })();
   try {
     return await connectInvitesInFlight;
@@ -4523,11 +4571,7 @@ async function fetchPersonalInvitesList(token) {
 }
 
 function findInviteMatch({ invitesPayload, operatorId, name, age }) {
-  const list = Array.isArray(invitesPayload?.newList)
-    ? invitesPayload.newList
-    : Array.isArray(invitesPayload?.list)
-    ? invitesPayload.list
-    : [];
+  const list = extractConnectInvitesList(invitesPayload);
   if (!list.length) throw new Error("Список инвайтов пуст");
   const targetName = String(name || "").trim().toLowerCase();
   const targetAge = Number(age);
@@ -4560,29 +4604,131 @@ async function fetchMyProfileByUserId({ token, userId }) {
   if (!key) throw new Error("Не найден man_external_id");
   const cached = connectProfileCache.get(key);
   const now = Date.now();
-  if (cached && cached.expiresAt > now) return cached.data;
+  if (cached && cached.expiresAt > now && isValidConnectProfilePayload(cached.data)) {
+    return cached.data;
+  }
   if (connectProfileInFlight.has(key)) {
     return connectProfileInFlight.get(key);
   }
   const requestPromise = (async () => {
-    const url = new URL(CONNECT_MY_PROFILE_ENDPOINT);
-    url.searchParams.set("user_id", key);
-    url.searchParams.set("activeProfile", "false");
-    const data = await profileSwitchRequest({
-      url: url.toString(),
-      token,
-    });
-    connectProfileCache.set(key, {
-      expiresAt: Date.now() + CONNECT_PROFILE_CACHE_TTL_MS,
-      data: data || {},
-    });
-    return data || {};
+    const requestOnce = async () => {
+      const url = new URL(CONNECT_MY_PROFILE_ENDPOINT);
+      url.searchParams.set("user_id", key);
+      url.searchParams.set("activeProfile", "false");
+      return await profileSwitchRequest({
+        url: url.toString(),
+        token,
+      });
+    };
+    let data = await requestOnce();
+    if (!isValidConnectProfilePayload(data)) {
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      data = await requestOnce();
+    }
+    if (isValidConnectProfilePayload(data)) {
+      connectProfileCache.set(key, {
+        expiresAt: Date.now() + CONNECT_PROFILE_CACHE_TTL_MS,
+        data,
+      });
+      return data;
+    }
+    if (cached && isValidConnectProfilePayload(cached.data)) {
+      return cached.data;
+    }
+    throw new Error("Не удалось получить данные профиля");
   })();
   connectProfileInFlight.set(key, requestPromise);
   try {
     return await requestPromise;
   } finally {
     connectProfileInFlight.delete(key);
+  }
+}
+
+async function resolveConnectManExternalId({ itemEl, token = "", operatorId = null }) {
+  const parsed = parseConnectCardNameAge(itemEl);
+  const effectiveToken = String(token || "").trim() || (await getAuthTokenForConnectInfo());
+  if (!effectiveToken) throw new Error("Токен не найден");
+  const effectiveOperatorId = Number.isFinite(operatorId)
+    ? operatorId
+    : getCurrentOperatorIdForConnectInfo(effectiveToken);
+  if (!Number.isFinite(effectiveOperatorId)) throw new Error("Не найден operator_id");
+  const invitesPayload = await fetchPersonalInvitesList(effectiveToken);
+  const inviteMatch = findInviteMatch({
+    invitesPayload,
+    operatorId: effectiveOperatorId,
+    name: parsed.name,
+    age: parsed.age,
+  });
+  const manExternalId = String(
+    inviteMatch?.man_external_id || inviteMatch?.manExternalId || ""
+  ).trim();
+  if (!manExternalId) throw new Error("Не найден man_external_id");
+  return {
+    parsed,
+    token: effectiveToken,
+    operatorId: effectiveOperatorId,
+    manExternalId,
+  };
+}
+
+function setConnectTgButtonState(button, state, count = null, message = "") {
+  if (!button) return;
+  const mode = String(state || "idle").trim();
+  if (mode === "loading") {
+    button.textContent = "🤖…";
+    button.disabled = true;
+    button.style.opacity = "0.6";
+    button.setAttribute("aria-busy", "true");
+    button.title = "Проверка отчётов в Telegram...";
+    return;
+  }
+  button.disabled = false;
+  button.style.opacity = "";
+  button.removeAttribute("aria-busy");
+  if (mode === "success") {
+    button.textContent = `🤖 ${Number.isFinite(count) ? count : "—"}`;
+    button.title = Number.isFinite(count)
+      ? `Отчётов в Telegram: ${count}`
+      : "Отчёты в Telegram: —";
+    return;
+  }
+  if (mode === "error") {
+    button.textContent = "🤖 !";
+    button.title = String(message || "Не удалось получить TG отчёты");
+    return;
+  }
+  button.textContent = "🤖";
+  button.title = "Проверить отчёты в Telegram";
+}
+
+async function fetchTgReportsCountByMaleId(maleId) {
+  const normalizedMaleId = String(maleId || "").trim();
+  if (!normalizedMaleId) return null;
+  const now = Date.now();
+  const cached = connectTgCountCache.get(normalizedMaleId);
+  if (cached && cached.expiresAt > now) {
+    return Number.isFinite(cached.count) ? cached.count : null;
+  }
+  if (connectTgCountInFlight.has(normalizedMaleId)) {
+    return connectTgCountInFlight.get(normalizedMaleId);
+  }
+  const promise = (async () => {
+    const count = await fetchLegacyReportsCountByMaleId(normalizedMaleId);
+    if (Number.isFinite(count)) {
+      connectTgCountCache.set(normalizedMaleId, {
+        count,
+        expiresAt: Date.now() + CONNECT_TG_COUNT_CACHE_TTL_MS,
+      });
+      return count;
+    }
+    return null;
+  })();
+  connectTgCountInFlight.set(normalizedMaleId, promise);
+  try {
+    return await promise;
+  } finally {
+    connectTgCountInFlight.delete(normalizedMaleId);
   }
 }
 
@@ -4706,9 +4852,9 @@ async function handleConnectInfoButtonClick(event) {
     return;
   }
   const item = button.closest(CONNECT_CHOOSE_MAN_ITEM_SELECTOR);
-  let parsed = null;
+  let resolved = null;
   try {
-    parsed = parseConnectCardNameAge(item);
+    resolved = await resolveConnectManExternalId({ itemEl: item });
   } catch (err) {
     closeProfileInfoPopover();
     const fallbackPopover = openConnectInfoPopover(button, "Информация о мужчине");
@@ -4719,36 +4865,24 @@ async function handleConnectInfoButtonClick(event) {
     return;
   }
   closeProfileInfoPopover();
-  const popover = openConnectInfoPopover(button, `${parsed.name} ${parsed.age}`);
+  const popover = openConnectInfoPopover(
+    button,
+    `${resolved.parsed.name} ${resolved.parsed.age}`
+  );
   button.disabled = true;
   button.style.opacity = "0.6";
   button.setAttribute("aria-busy", "true");
   try {
-    const token = await getAuthTokenForConnectInfo();
-    if (!token) throw new Error("Токен не найден");
-    const operatorId = getCurrentOperatorIdForConnectInfo(token);
-    if (!Number.isFinite(operatorId)) throw new Error("Не найден operator_id");
-    const invitesPayload = await fetchPersonalInvitesList(token);
-    const inviteMatch = findInviteMatch({
-      invitesPayload,
-      operatorId,
-      name: parsed.name,
-      age: parsed.age,
-    });
-    const manExternalId = String(
-      inviteMatch?.man_external_id || inviteMatch?.manExternalId || ""
-    ).trim();
-    if (!manExternalId) throw new Error("Не найден man_external_id");
     const profileData = await fetchMyProfileByUserId({
-      token,
-      userId: manExternalId,
+      token: resolved.token,
+      userId: resolved.manExternalId,
     });
     if (currentProfilePopover !== popover || currentProfilePopoverButton !== button) return;
     renderConnectInfoPopover({
       popover,
-      cardName: parsed.name,
-      cardAge: parsed.age,
-      manExternalId,
+      cardName: resolved.parsed.name,
+      cardAge: resolved.parsed.age,
+      manExternalId: resolved.manExternalId,
       profileData,
     });
   } catch (err) {
@@ -4762,6 +4896,31 @@ async function handleConnectInfoButtonClick(event) {
     button.disabled = false;
     button.style.opacity = "";
     button.removeAttribute("aria-busy");
+  }
+}
+
+async function handleConnectTgButtonClick(event) {
+  event.preventDefault();
+  event.stopPropagation();
+  const button = event.currentTarget;
+  if (!button || button.disabled) return;
+  const item = button.closest(CONNECT_CHOOSE_MAN_ITEM_SELECTOR);
+  setConnectTgButtonState(button, "loading");
+  try {
+    const resolved = await resolveConnectManExternalId({ itemEl: item });
+    const count = await fetchTgReportsCountByMaleId(resolved.manExternalId);
+    if (!Number.isFinite(count)) {
+      setConnectTgButtonState(button, "error", null, "Не удалось получить TG отчёты");
+      return;
+    }
+    setConnectTgButtonState(button, "success", count);
+  } catch (err) {
+    setConnectTgButtonState(
+      button,
+      "error",
+      null,
+      String(err?.message || "Не удалось получить TG отчёты")
+    );
   }
 }
 
@@ -4789,6 +4948,30 @@ function createConnectManInfoButton() {
   return button;
 }
 
+function createConnectManTgButton() {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = CONNECT_MAN_TG_BUTTON_CLASS;
+  button.style.height = "28px";
+  button.style.minWidth = "56px";
+  button.style.padding = "0 8px";
+  button.style.margin = "0";
+  button.style.border = "1px solid rgba(31,79,116,0.28)";
+  button.style.borderRadius = "14px";
+  button.style.background = "rgba(255,255,255,0.96)";
+  button.style.cursor = "pointer";
+  button.style.display = "inline-flex";
+  button.style.alignItems = "center";
+  button.style.justifyContent = "center";
+  button.style.fontSize = "12px";
+  button.style.fontWeight = "700";
+  button.style.lineHeight = "1";
+  button.style.color = "#1f4f74";
+  setConnectTgButtonState(button, "idle");
+  button.addEventListener("click", handleConnectTgButtonClick);
+  return button;
+}
+
 function ensureConnectManInfoButtons() {
   try {
     const containers = document.querySelectorAll(CONNECT_COUNTRY_CONTENT_SELECTOR);
@@ -4796,17 +4979,30 @@ function ensureConnectManInfoButtons() {
     containers.forEach((container) => {
       const items = container.querySelectorAll(CONNECT_CHOOSE_MAN_ITEM_SELECTOR);
       items.forEach((item) => {
-        if (!item || item.querySelector(`.${CONNECT_MAN_INFO_CONTAINER_CLASS}`)) return;
+        if (!item || item.querySelector(`.${CONNECT_MAN_ACTIONS_CONTAINER_CLASS}`)) return;
         const buttonsWrap = item.querySelector(CONNECT_BUTTONS_SELECTOR);
         if (!buttonsWrap || !buttonsWrap.parentElement) return;
+        const actionsWrap = document.createElement("div");
+        actionsWrap.className = CONNECT_MAN_ACTIONS_CONTAINER_CLASS;
+        actionsWrap.style.display = "inline-flex";
+        actionsWrap.style.alignItems = "center";
+        actionsWrap.style.gap = "6px";
+        actionsWrap.style.marginRight = "8px";
+        const tgWrap = document.createElement("div");
+        tgWrap.className = CONNECT_MAN_TG_CONTAINER_CLASS;
+        tgWrap.style.display = "inline-flex";
+        tgWrap.style.alignItems = "center";
+        tgWrap.style.justifyContent = "center";
+        tgWrap.appendChild(createConnectManTgButton());
         const infoWrap = document.createElement("div");
         infoWrap.className = CONNECT_MAN_INFO_CONTAINER_CLASS;
         infoWrap.style.display = "inline-flex";
         infoWrap.style.alignItems = "center";
         infoWrap.style.justifyContent = "center";
-        infoWrap.style.marginRight = "8px";
         infoWrap.appendChild(createConnectManInfoButton());
-        buttonsWrap.parentElement.insertBefore(infoWrap, buttonsWrap);
+        actionsWrap.appendChild(tgWrap);
+        actionsWrap.appendChild(infoWrap);
+        buttonsWrap.parentElement.insertBefore(actionsWrap, buttonsWrap);
       });
     });
   } catch {}
