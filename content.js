@@ -308,6 +308,8 @@ const MONITOR_ENDPOINTS = Object.freeze({
   mail: "https://alpha.date/api/mailbox/mail",
   senderList: "https://alpha.date/api/sender/senderList",
 });
+const CONFIG_TYPE_CHECK_ENDPOINT = "https://alpha.date/api/config/type/check";
+const CONFIG_TYPE_CACHE_TTL_MS = 60 * 1000;
 
 function notifyMonitorRecord(kind, profileId, count) {
   try {
@@ -324,6 +326,8 @@ let monitorBridgeInitialized = false;
 let senderListBridgeInitialized = false;
 let wsEventBridgeInitialized = false;
 let wsEventQueue = [];
+const wsConfigTypeCache = new Map();
+const wsConfigTypeInFlight = new Map();
 
 function handleMonitorBridgeMessage(event) {
   try {
@@ -382,6 +386,140 @@ function findChatUidInPayload(payload) {
   return findChatUidInPayload(payload.response || payload.data || null);
 }
 
+function normalizeExternalId(value) {
+  const raw = String(value ?? "").trim();
+  if (!raw) return "";
+  return raw.replace(/\D/g, "");
+}
+
+function getConfigTypeCacheKey(manExternalID, womanExternalID) {
+  const man = normalizeExternalId(manExternalID);
+  const woman = normalizeExternalId(womanExternalID);
+  if (!man || !woman) return "";
+  return `${man}::${woman}`;
+}
+
+async function getAuthTokenForConfigCheck() {
+  try {
+    const module = await loadUserInfoModule();
+    const token =
+      module && typeof module.getAuthToken === "function" ? module.getAuthToken() : "";
+    const normalized = String(token || "").trim();
+    if (normalized) return normalized;
+  } catch {}
+  try {
+    const fallback = String(getAuthTokenFromStorage() || "").trim();
+    if (fallback) return fallback;
+  } catch {}
+  try {
+    return String(window?.localStorage?.getItem?.("token") || "").trim();
+  } catch {
+    return "";
+  }
+}
+
+async function fetchConfigTypeCheck({ token, manExternalID, womanExternalID }) {
+  const man = normalizeExternalId(manExternalID);
+  const woman = normalizeExternalId(womanExternalID);
+  if (!token || !man || !woman) return null;
+  try {
+    const response = await fetch(CONFIG_TYPE_CHECK_ENDPOINT, {
+      method: "POST",
+      credentials: "include",
+      headers: {
+        accept: "application/json, text/plain, */*",
+        "content-type": "application/json",
+        authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify({
+        manExternalID: man,
+        womanExternalID: woman,
+      }),
+    });
+    if (!response.ok) return null;
+    const payload = await response.json().catch(() => null);
+    if (!payload || payload.status !== true) return null;
+    const type = Number(payload?.result?.type);
+    if (type !== 1 && type !== 2 && type !== 3) return null;
+    return {
+      type,
+      isAlert: !!payload?.result?.isAlert,
+    };
+  } catch {
+    return null;
+  }
+}
+
+async function resolveEventConfigType(eventItem) {
+  const manExternalID = normalizeExternalId(eventItem?.manExternalID);
+  const womanExternalID = normalizeExternalId(eventItem?.womanExternalID);
+  const cacheKey = getConfigTypeCacheKey(manExternalID, womanExternalID);
+  if (!cacheKey) return null;
+  const now = Date.now();
+  const cached = wsConfigTypeCache.get(cacheKey);
+  if (cached && Number(cached.expiresAt) > now) {
+    const cachedType = Number(cached.type);
+    return cachedType === 1 || cachedType === 2 || cachedType === 3 ? cachedType : null;
+  }
+  const inFlight = wsConfigTypeInFlight.get(cacheKey);
+  if (inFlight) {
+    return inFlight.catch(() => null);
+  }
+  const requestPromise = (async () => {
+    const token = await getAuthTokenForConfigCheck();
+    if (!token) return null;
+    const result = await fetchConfigTypeCheck({
+      token,
+      manExternalID,
+      womanExternalID,
+    });
+    const type = Number(result?.type);
+    if (type === 1 || type === 2 || type === 3) {
+      wsConfigTypeCache.set(cacheKey, {
+        type,
+        expiresAt: now + CONFIG_TYPE_CACHE_TTL_MS,
+      });
+      return type;
+    }
+    wsConfigTypeCache.set(cacheKey, {
+      type: null,
+      expiresAt: now + CONFIG_TYPE_CACHE_TTL_MS,
+    });
+    return null;
+  })();
+  wsConfigTypeInFlight.set(cacheKey, requestPromise);
+  try {
+    return await requestPromise;
+  } catch {
+    return null;
+  } finally {
+    wsConfigTypeInFlight.delete(cacheKey);
+  }
+}
+
+function getEventRowClassByType(type) {
+  const normalized = Number(type);
+  if (normalized === 1) return "adb-row-type-1";
+  if (normalized === 2) return "adb-row-type-2";
+  if (normalized === 3) return "adb-row-type-3";
+  return "";
+}
+
+async function enrichWsEventWithConfigType(item) {
+  if (!item || typeof item !== "object") return item;
+  const normalized = {
+    ...item,
+    manExternalID: normalizeExternalId(item.manExternalID),
+    womanExternalID: normalizeExternalId(item.womanExternalID),
+    configType: null,
+  };
+  const type = await resolveEventConfigType(normalized);
+  if (type === 1 || type === 2 || type === 3) {
+    normalized.configType = type;
+  }
+  return normalized;
+}
+
 async function resolveMailChatUidFromSocket(payload) {
   const femaleId = String(payload?.female_id || "").replace(/\D/g, "");
   const maleExternalId = String(payload?.male_external_id || "").replace(/\D/g, "");
@@ -413,18 +551,28 @@ function handleWsEventBridgeMessage(event) {
     if (!payload || typeof payload !== "object") return;
     const socketAction = String(payload.action || "").toLowerCase();
     if (
-      (socketAction === "mail" || socketAction === "read_mail") &&
+      (socketAction === "mail" ||
+        socketAction === "read_mail" ||
+        socketAction === "reaction_limits") &&
       payload.female_id &&
       payload.male_external_id
     ) {
       resolveMailChatUidFromSocket(payload)
-        .then((chatUid) => {
+        .then(async (chatUid) => {
           if (!chatUid) return;
-          const item = {
-            message_type: socketAction === "read_mail" ? "READ_MAIL" : "SENT_MAIL",
+          const itemBase = {
+            message_type:
+              socketAction === "read_mail"
+                ? "READ_MAIL"
+                : socketAction === "reaction_limits"
+                ? "READ_MAIL_CONTENT"
+                : "SENT_MAIL",
             created_at: payload.created_at || new Date().toISOString(),
             chat_uid: chatUid,
+            manExternalID: normalizeExternalId(payload.male_external_id),
+            womanExternalID: normalizeExternalId(payload.female_id),
           };
+          const item = await enrichWsEventWithConfigType(itemBase);
           const monitor = ui?.balanceMonitor;
           if (monitor && typeof monitor.addWsEvent === "function") {
             monitor.addWsEvent(item);
@@ -435,12 +583,34 @@ function handleWsEventBridgeMessage(event) {
         .catch(() => {});
       return;
     }
-    const monitor = ui?.balanceMonitor;
-    if (monitor && typeof monitor.addWsEvent === "function") {
-      monitor.addWsEvent(payload);
-      return;
-    }
-    wsEventQueue.push(payload);
+    const baseItem = {
+      ...payload,
+      manExternalID:
+        normalizeExternalId(payload.manExternalID) ||
+        normalizeExternalId(payload.sender_external_id) ||
+        normalizeExternalId(payload.senderExternalId),
+      womanExternalID:
+        normalizeExternalId(payload.womanExternalID) ||
+        normalizeExternalId(payload.recipient_external_id) ||
+        normalizeExternalId(payload.recipientExternalId),
+    };
+    enrichWsEventWithConfigType(baseItem)
+      .then((item) => {
+        const monitor = ui?.balanceMonitor;
+        if (monitor && typeof monitor.addWsEvent === "function") {
+          monitor.addWsEvent(item);
+          return;
+        }
+        wsEventQueue.push(item);
+      })
+      .catch(() => {
+        const monitor = ui?.balanceMonitor;
+        if (monitor && typeof monitor.addWsEvent === "function") {
+          monitor.addWsEvent(baseItem);
+          return;
+        }
+        wsEventQueue.push(baseItem);
+      });
   } catch {}
 }
 
@@ -591,21 +761,21 @@ function createBalanceMonitorWidget() {
       <div class="adb-tools"></div>
       <div class="adb-tabs" role="tablist" aria-label="ADB details tabs">
         <button
-          id="adb-tab-balance"
+          id="adb-tab-webhooks"
           class="adb-tab active"
           type="button"
           role="tab"
           aria-selected="true"
-          aria-controls="adb-panel-balance"
-        >Баланс</button>
+          aria-controls="adb-panel-webhooks"
+        >События</button>
         <button
-          id="adb-tab-webhooks"
+          id="adb-tab-balance"
           class="adb-tab"
           type="button"
           role="tab"
           aria-selected="false"
-          aria-controls="adb-panel-webhooks"
-        >Webhooks</button>
+          aria-controls="adb-panel-balance"
+        >Баланс</button>
       </div>
       <div
         id="adb-panel-balance"
@@ -992,8 +1162,42 @@ function createBalanceMonitorWidget() {
     return 0;
   }
 
-  function formatWsTime(value) {
+  function formatWsTime(value, messageType = "") {
     if (!value) return "";
+    const raw = String(value || "").trim();
+    const type = String(messageType || "").toUpperCase();
+    // Mail-like socket timestamps often come as "YYYY-MM-DD HH:mm:ss" without TZ.
+    // Server can send these as UTC; parse explicitly as UTC and render in local TZ.
+    if (raw && type.includes("MAIL")) {
+      const match = raw.match(/^(\d{4}-\d{2}-\d{2})[ T](\d{2}):(\d{2})(?::\d{2})?$/);
+      if (match) {
+        const datePart = match[1].split("-").map(Number);
+        const hour = Number(match[2]);
+        const minute = Number(match[3]);
+        if (
+          datePart.length === 3 &&
+          Number.isFinite(datePart[0]) &&
+          Number.isFinite(datePart[1]) &&
+          Number.isFinite(datePart[2]) &&
+          Number.isFinite(hour) &&
+          Number.isFinite(minute)
+        ) {
+          const utcDate = new Date(
+            Date.UTC(datePart[0], datePart[1] - 1, datePart[2], hour, minute, 0)
+          );
+          if (!Number.isNaN(utcDate.getTime())) {
+            try {
+              return utcDate.toLocaleTimeString(undefined, {
+                hour: "2-digit",
+                minute: "2-digit",
+              });
+            } catch {
+              return utcDate.toTimeString().slice(0, 5);
+            }
+          }
+        }
+      }
+    }
     const date = value instanceof Date ? value : new Date(value);
     if (Number.isNaN(date.getTime())) return "";
     try {
@@ -1028,12 +1232,15 @@ function createBalanceMonitorWidget() {
         const createdAt = item?.created_at || "";
         const chatUid = String(item?.chat_uid || "").trim();
         if (!messageType || !chatUid) return "";
-        const timeLabel = formatWsTime(createdAt);
+        const timeLabel = formatWsTime(createdAt, messageType);
         const safeType = escapeHtml(messageType);
         const safeTime = escapeHtml(timeLabel || "");
         const link = buildWsLink(messageType, chatUid);
         const safeHref = escapeHtml(link);
-        const rowClass = item?.seen ? "adb-row" : "adb-row new";
+        const typeClass = getEventRowClassByType(item?.configType);
+        const rowClass = [item?.seen ? "adb-row" : "adb-row new", typeClass]
+          .filter(Boolean)
+          .join(" ");
         return `
           <a class="${rowClass}" href="${safeHref}" target="_blank" rel="noopener" title="${safeType}">
             <span class="adb-time">${safeTime}</span>
@@ -1378,11 +1585,21 @@ function createBalanceMonitorWidget() {
         const createdAt = eventPayload.created_at || "";
         const chatUid = String(eventPayload.chat_uid || "").trim();
         if (!messageType || !chatUid) return;
+        const manExternalID = normalizeExternalId(eventPayload.manExternalID);
+        const womanExternalID = normalizeExternalId(eventPayload.womanExternalID);
+        const configTypeRaw = Number(eventPayload.configType);
+        const configType =
+          configTypeRaw === 1 || configTypeRaw === 2 || configTypeRaw === 3
+            ? configTypeRaw
+            : null;
         ensureWsEventsDayKey();
         wsEvents.unshift({
           message_type: messageType,
           created_at: createdAt,
           chat_uid: chatUid,
+          manExternalID,
+          womanExternalID,
+          configType,
           seen: false,
         });
         if (wsEvents.length > 200) {
@@ -1453,6 +1670,8 @@ const LETTERS_NAV_SELECTOR =
 const LETTERS_NEW_WINDOW_STORAGE_KEY = "lettersOpenInNewWindow";
 const LETTERS_OPEN_HOTKEY_STORAGE_KEY = "lettersOpenHotkey";
 const LETTERS_OPEN_HOTKEY_DEFAULT = "ctrl+l";
+const PROFILE_PHOTO_HOTKEY_STORAGE_KEY = "profilePhotoHotkey";
+const PROFILE_PHOTO_HOTKEY_DEFAULT = "ctrl+p";
 const CHAT_UID_LOOKUP_URL =
   "https://alpha.date/api/chatList/chatUidByProfileAndUserIds";
 
@@ -1632,79 +1851,20 @@ function setLettersOpenHotkey(next, options = {}) {
   }
 }
 
-function setSettingsProfileLookupStatus(message, tone = "muted") {
-  if (!ui?.settingsProfileLookupStatus) return;
-  const node = ui.settingsProfileLookupStatus;
-  const textValue = String(message || "").trim();
-  node.textContent = textValue;
-  node.classList.remove("muted", "error", "success");
-  node.classList.add(
-    tone === "error" ? "error" : tone === "success" ? "success" : "muted"
-  );
-}
-
-async function requestSettingsProfileByUserId() {
-  if (!ui?.settingsProfileUserIdInput || !ui?.settingsProfileLookupBtn) return;
-  const normalizedId = onlyDigits(ui.settingsProfileUserIdInput.value || "");
-  ui.settingsProfileUserIdInput.value = normalizedId;
-  if (!normalizedId) {
-    setSettingsProfileLookupStatus("Введите корректный user_id", "error");
-    return;
+function setProfilePhotoHotkey(next, options = {}) {
+  const { persist = true } = options || {};
+  const normalized = normalizeLettersOpenHotkeyInput(next);
+  profilePhotoHotkey = normalized || PROFILE_PHOTO_HOTKEY_DEFAULT;
+  profilePhotoHotkeyParsed = parseLettersOpenHotkey(profilePhotoHotkey);
+  if (!profilePhotoHotkeyParsed) {
+    profilePhotoHotkey = PROFILE_PHOTO_HOTKEY_DEFAULT;
+    profilePhotoHotkeyParsed = parseLettersOpenHotkey(profilePhotoHotkey);
   }
-  let token = "";
-  try {
-    const module = await loadUserInfoModule();
-    token = String(module?.getAuthToken?.() || "").trim();
-  } catch {}
-  if (!token) {
-    try {
-      token = String(window?.localStorage?.getItem?.("token") || "").trim();
-    } catch {}
+  if (ui?.profilePhotoHotkeyInput) {
+    ui.profilePhotoHotkeyInput.value = profilePhotoHotkey;
   }
-  if (!token) {
-    setSettingsProfileLookupStatus("Токен не найден", "error");
-    return;
-  }
-  ui.settingsProfileLookupBtn.disabled = true;
-  setSettingsProfileLookupStatus("Отправка запроса...", "muted");
-  try {
-    const url = new URL("https://alpha.date/api/operator/myProfile");
-    url.searchParams.set("user_id", normalizedId);
-    url.searchParams.set("activeProfile", "false");
-    const response = await fetch(url.toString(), {
-      method: "GET",
-      credentials: "include",
-      headers: {
-        Authorization: `Bearer ${token}`,
-        accept: "application/json, text/plain, */*",
-      },
-    });
-    if (!response.ok) {
-      setSettingsProfileLookupStatus(`Ошибка ${response.status}`, "error");
-      toast(`myProfile: ошибка ${response.status}`);
-      return;
-    }
-    const payload = await response.json().catch(() => null);
-    const preview =
-      payload && typeof payload === "object"
-        ? String(
-            payload?.operator_name ||
-              payload?.name ||
-              payload?.username ||
-              payload?.id ||
-              "ok"
-          )
-        : "ok";
-    setSettingsProfileLookupStatus(`Успех: ${preview}`, "success");
-    try {
-      LOG.log("settings myProfile response", payload);
-      console.log("[OT4ET] myProfile response", payload);
-    } catch {}
-  } catch {
-    setSettingsProfileLookupStatus("Не удалось выполнить запрос", "error");
-    toast("myProfile: сервер недоступен");
-  } finally {
-    ui.settingsProfileLookupBtn.disabled = false;
+  if (persist) {
+    setStore({ [PROFILE_PHOTO_HOTKEY_STORAGE_KEY]: profilePhotoHotkey });
   }
 }
 
@@ -1726,9 +1886,8 @@ function normalizeEventCodeForHotkey(event) {
   return "";
 }
 
-function isLettersHotkeyPressed(event) {
+function isHotkeyPressed(event, parsed) {
   if (!event || event.repeat || event.defaultPrevented) return false;
-  const parsed = lettersOpenHotkeyParsed;
   if (!parsed) return false;
   const key = normalizeEventCodeForHotkey(event) || normalizeEventKeyForHotkey(event);
   if (!key || key !== parsed.key) return false;
@@ -1737,6 +1896,10 @@ function isLettersHotkeyPressed(event) {
   if (!!event.shiftKey !== !!parsed.shift) return false;
   if (!!event.altKey !== !!parsed.alt) return false;
   return true;
+}
+
+function isLettersHotkeyPressed(event) {
+  return isHotkeyPressed(event, lettersOpenHotkeyParsed);
 }
 
 function handleLettersBindHotkey(event) {
@@ -1764,6 +1927,23 @@ function handleLettersBindHotkey(event) {
     if (!btn) return;
     btn.click();
     return;
+  } catch {}
+}
+
+function isProfilePhotoHotkeyPressed(event) {
+  return isHotkeyPressed(event, profilePhotoHotkeyParsed);
+}
+
+function handleProfilePhotoBindHotkey(event) {
+  try {
+    if (!isProfilePhotoHotkeyPressed(event)) return;
+    const target =
+      document.querySelector('[class*="styles_clmn_3_chat_head_profile_photo__"]') ||
+      document.querySelector(".styles_clmn_3_chat_head_profile_photo__ZOnF4");
+    if (!target || typeof target.click !== "function") return;
+    event.preventDefault();
+    event.stopPropagation();
+    target.click();
   } catch {}
 }
 
@@ -3023,6 +3203,8 @@ let logoWhiteSquareBalancePersistTimer = null;
 let lettersOpenInNewWindow = false;
 let lettersOpenHotkey = LETTERS_OPEN_HOTKEY_DEFAULT;
 let lettersOpenHotkeyParsed = null;
+let profilePhotoHotkey = PROFILE_PHOTO_HOTKEY_DEFAULT;
+let profilePhotoHotkeyParsed = null;
 let settingsMenuOpen = false;
 let settingsMenuCleanup = null;
 let adminReadOnlyLatched = false;
@@ -9904,16 +10086,14 @@ function buildPanel() {
       #adb-header.open #adb-toggle{background:rgba(95,168,255,0.12)}
       #adb-toggle:focus-visible{outline:2px solid rgba(95,168,255,0.6)}
       #adb-total{font-size:28px;color:#2b7a78;line-height:1}
-      #adb-total.fresh{color:#1aa859}
-      #adb-total.ws-fresh{color:#1aa859}
       #adb-chevron{font-size:16px;color:inherit;transition:transform .2s ease}
       #adb-header.open #adb-chevron{transform:rotate(180deg)}
       #adb-details{position:absolute;top:calc(100% + 8px);left:0;z-index:6;display:flex;flex-direction:column;gap:4px;padding:8px;border-radius:3px;border:1px solid rgba(31,79,116,0.15);background:var(--ar-elevated-bg, ${PANEL_ELEVATED_BG});box-shadow:0 10px 28px rgba(31,79,116,0.18);opacity:0;transform:translateY(-6px);pointer-events:none;transition:opacity .12s ease, transform .12s ease;box-sizing:border-box;overflow:hidden}
       #adb-details::before{content:"";position:absolute;top:-6px;left:var(--adb-pointer-left, 30px);width:12px;height:12px;background:inherit;border-left:1px solid rgba(31,79,116,0.15);border-top:1px solid rgba(31,79,116,0.15);transform:rotate(45deg);pointer-events:none}
       #adb-details.open{opacity:1;transform:translateY(0);pointer-events:auto}
       #adb-details .adb-tools{display:flex;align-items:center;gap:12px;justify-content:flex-end;width:100%}
-      #adb-details .adb-tabs{display:flex;align-items:center;gap:6px;margin:2px 0 4px}
-      #adb-details .adb-tab{appearance:none;border:1px solid rgba(31,79,116,0.18);background:rgba(95,168,255,0.08);color:inherit;border-radius:3px;padding:2px 8px;font:12px/1.3 Consolas, monospace;cursor:pointer}
+      #adb-details .adb-tabs{display:flex;align-items:center;gap:6px;margin:2px 0 4px;width:100%}
+      #adb-details .adb-tab{appearance:none;border:1px solid rgba(31,79,116,0.18);background:rgba(95,168,255,0.08);color:inherit;border-radius:3px;padding:2px 8px;font:12px/1.3 Consolas, monospace;cursor:pointer;flex:1 1 0;min-width:0;text-align:center}
       #adb-details .adb-tab:hover{background:rgba(95,168,255,0.14)}
       #adb-details .adb-tab.active{background:rgba(95,168,255,0.2);border-color:rgba(31,79,116,0.28)}
       #adb-details .adb-tab:focus-visible{outline:2px solid rgba(95,168,255,0.55);outline-offset:1px}
@@ -9930,8 +10110,10 @@ function buildPanel() {
       .adb-legend{display:flex;flex-direction:column;gap:6px;min-width:0;width:100%}
       .adb-legend-row{display:flex;align-items:center;gap:8px}
       .adb-legend-swatch{width:10px;height:10px;border-radius:50%;flex:0 0 10px}
-      .adb-row.new{background:rgba(26,168,89,0.18);transition:background-color .2s ease}
       .adb-row{display:flex;min-width:100%;text-decoration:none;color:inherit}
+      .adb-row.adb-row-type-1{background:rgba(214,59,59,0.18)}
+      .adb-row.adb-row-type-2{background:rgba(46,115,216,0.18)}
+      .adb-row.adb-row-type-3{background:rgba(47,155,75,0.2)}
       .adb-row:hover{opacity:.85}
       .adb-price{flex:0 0 5ch;width:7ch;text-align:right;margin-right:2ch}
       .adb-label{flex:1 1 auto;overflow:hidden;position:relative}
@@ -10298,14 +10480,10 @@ function buildPanel() {
               <span>Горячая клавиша открытия письма</span>
             </label>
             <input class="settings-select" id="lettersOpenHotkeyInput" type="text" placeholder="Горячая клавиша (например cmd+l)">
-            <label class="settings-row" for="settingsProfileUserIdInput">
-              <span>Поиск профиля по ID</span>
+            <label class="settings-row" for="profilePhotoHotkeyInput">
+              <span>Горячая клавиша открытия профиля</span>
             </label>
-            <div class="settings-search-row">
-              <input class="settings-select" id="settingsProfileUserIdInput" type="text" inputmode="numeric" autocomplete="off" placeholder="Введите user_id">
-              <button type="button" id="settingsProfileLookupBtn" class="settings-search-btn">Окей</button>
-            </div>
-            <div id="settingsProfileLookupStatus" class="settings-status muted"></div>
+            <input class="settings-select" id="profilePhotoHotkeyInput" type="text" placeholder="Горячая клавиша (например ctrl+p)">
           </div>
         </div>
         <div class="row" id="row" style="display:none">
@@ -10404,9 +10582,7 @@ function buildPanel() {
     authModalError: shadow.getElementById("authModalError"),
     lettersNewWindowToggle: shadow.getElementById("lettersNewWindowToggle"),
     lettersOpenHotkeyInput: shadow.getElementById("lettersOpenHotkeyInput"),
-    settingsProfileUserIdInput: shadow.getElementById("settingsProfileUserIdInput"),
-    settingsProfileLookupBtn: shadow.getElementById("settingsProfileLookupBtn"),
-    settingsProfileLookupStatus: shadow.getElementById("settingsProfileLookupStatus"),
+    profilePhotoHotkeyInput: shadow.getElementById("profilePhotoHotkeyInput"),
     profileSwitch: null,
     pin: shadow.getElementById("pin"),
     close: shadow.getElementById("close"),
@@ -13359,6 +13535,7 @@ window.addEventListener("unload", () => {
   try {
     document.addEventListener("click", handleLettersNavClick, true);
     document.addEventListener("keydown", handleLettersBindHotkey, true);
+    document.addEventListener("keydown", handleProfilePhotoBindHotkey, true);
   } catch {}
   await loadExtensionLockState();
   buildPanel();
@@ -13375,6 +13552,7 @@ window.addEventListener("unload", () => {
     templatesLastFolder: lastTemplateFolder,
     [LETTERS_NEW_WINDOW_STORAGE_KEY]: lettersNewWindowStored,
     [LETTERS_OPEN_HOTKEY_STORAGE_KEY]: lettersOpenHotkeyStored,
+    [PROFILE_PHOTO_HOTKEY_STORAGE_KEY]: profilePhotoHotkeyStored,
   } = await getStore([
     "lang",
     "pinned",
@@ -13385,6 +13563,7 @@ window.addEventListener("unload", () => {
     TEMPLATE_LAST_FOLDER_KEY,
     LETTERS_NEW_WINDOW_STORAGE_KEY,
     LETTERS_OPEN_HOTKEY_STORAGE_KEY,
+    PROFILE_PHOTO_HOTKEY_STORAGE_KEY,
   ]);
   currentLang = lang || "ru";
   pinned = !!p;
@@ -13392,6 +13571,7 @@ window.addEventListener("unload", () => {
     lettersOpenInNewWindow = lettersNewWindowStored;
   }
   setLettersOpenHotkey(lettersOpenHotkeyStored, { persist: false });
+  setProfilePhotoHotkey(profilePhotoHotkeyStored, { persist: false });
   historyItems = Array.isArray(hist) ? hist : [];
   if (storedTaHeight) applyTextareaHeight(storedTaHeight);
   // Если день сменился с прошлого запуска — начинаем с пустого поля (без автозагрузки)
@@ -13493,21 +13673,13 @@ window.addEventListener("unload", () => {
       setLettersOpenHotkey(event?.target?.value);
     });
   }
-  if (ui?.settingsProfileUserIdInput) {
-    ui.settingsProfileUserIdInput.addEventListener("input", (event) => {
-      const normalized = onlyDigits(event?.target?.value || "");
-      if (event?.target) event.target.value = normalized;
+  if (ui?.profilePhotoHotkeyInput) {
+    setProfilePhotoHotkey(profilePhotoHotkey, { persist: false });
+    ui.profilePhotoHotkeyInput.addEventListener("change", (event) => {
+      setProfilePhotoHotkey(event?.target?.value);
     });
-    ui.settingsProfileUserIdInput.addEventListener("keydown", (event) => {
-      if (event.key === "Enter") {
-        event.preventDefault();
-        requestSettingsProfileByUserId();
-      }
-    });
-  }
-  if (ui?.settingsProfileLookupBtn) {
-    ui.settingsProfileLookupBtn.addEventListener("click", () => {
-      requestSettingsProfileByUserId();
+    ui.profilePhotoHotkeyInput.addEventListener("blur", (event) => {
+      setProfilePhotoHotkey(event?.target?.value);
     });
   }
   if (ui?.settingsBtn) {

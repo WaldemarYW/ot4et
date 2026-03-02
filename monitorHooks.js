@@ -354,6 +354,32 @@
         }
         return;
       }
+      // Special mail-content view shape: action=REACTION_LIMITS with IDs only.
+      if (action === "reaction_limits") {
+        const femaleIdRaw = extractFirstValue(payload, [
+          "female_id",
+          "femaleId",
+          "female_external_id",
+          "femaleExternalId",
+        ]);
+        const maleExternalRaw = extractFirstValue(payload, [
+          "male_external_id",
+          "maleExternalId",
+        ]);
+        const femaleId = String(femaleIdRaw || "").replace(/\D/g, "");
+        const maleExternalId = String(maleExternalRaw || "").replace(/\D/g, "");
+        if (femaleId && maleExternalId) {
+          postWsEvent({
+            action,
+            female_id: femaleId,
+            male_external_id: maleExternalId,
+            created_at:
+              extractFirstValue(payload, ["updated_limit_at", "updatedAt"]) ||
+              new Date().toISOString(),
+          });
+        }
+        return;
+      }
       const payedVal = extractFirstValue(source, ["payed", "paid"]);
       const payed = Number(payedVal);
       if (!Number.isFinite(payed) || payed <= 0) return;
@@ -367,12 +393,25 @@
         "createdAt",
       ]);
       const chatUid = extractFirstValue(source, ["chat_uid", "chatUid"]);
+      const senderExternalId = extractFirstValue(source, [
+        "sender_external_id",
+        "senderExternalId",
+      ]) ?? extractFirstValue(payload, ["sender_external_id", "senderExternalId"]);
+      const recipientExternalId = extractFirstValue(source, [
+        "recipient_external_id",
+        "recipientExternalId",
+      ]) ?? extractFirstValue(payload, [
+        "recipient_external_id",
+        "recipientExternalId",
+      ]);
       if (!messageType || !createdAt || !chatUid) return;
       if (!shouldEmitWsEvent(source, channelText)) return;
       postWsEvent({
         message_type: messageType,
         created_at: createdAt,
         chat_uid: chatUid,
+        sender_external_id: senderExternalId ?? null,
+        recipient_external_id: recipientExternalId ?? null,
       });
     }
 
