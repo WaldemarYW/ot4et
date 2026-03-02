@@ -230,9 +230,10 @@
       if (!kind) return;
       const payload = { type: "OT4ET_MONITOR_RECORD", kind };
       if (profileId) payload.profileId = profileId;
-      if (Number.isFinite(Number(count)) && Number(count) > 0) {
-        payload.count = Math.max(1, Math.round(Number(count)));
-      }
+      const normalizedCount = Number.isFinite(Number(count))
+        ? Math.max(1, Math.floor(Number(count)))
+        : 1;
+      if (normalizedCount > 1) payload.count = normalizedCount;
       window.postMessage(payload, "*");
     }
 
@@ -249,12 +250,205 @@
       window.postMessage({ type: "OT4ET_SENDER_LIST", payload }, "*");
     }
 
-    function extractMailCount(data) {
-      if (!data || typeof data !== "object") return 1;
-      const ids = data.message_id ?? data.messageId ?? data.message_ids;
-      if (Array.isArray(ids)) return ids.length || 1;
-      if (ids !== undefined && ids !== null) return 1;
-      return 1;
+    function postWsEvent(payload) {
+      try {
+        window.postMessage({ type: "OT4ET_WS_EVENT", payload }, "*");
+      } catch {}
+    }
+
+    function getKnownProfileIds() {
+      try {
+        const raw = window?.localStorage?.getItem?.("__ot4et_profile_ids__");
+        if (!raw) return [];
+        const parsed = JSON.parse(raw);
+        if (Array.isArray(parsed)) {
+          return parsed.map((val) => String(val || "").trim()).filter(Boolean);
+        }
+      } catch {}
+      return [];
+    }
+
+    function extractFirstValue(data, keys, seen = new WeakSet()) {
+      if (!data || typeof data !== "object") return null;
+      if (seen.has(data)) return null;
+      seen.add(data);
+      if (Array.isArray(data)) {
+        for (const item of data) {
+          const found = extractFirstValue(item, keys, seen);
+          if (found != null) return found;
+        }
+        return null;
+      }
+      for (const key of keys) {
+        if (Object.prototype.hasOwnProperty.call(data, key)) {
+          const val = data[key];
+          if (val !== undefined) return val;
+        }
+      }
+      for (const value of Object.values(data)) {
+        const found = extractFirstValue(value, keys, seen);
+        if (found != null) return found;
+      }
+      return null;
+    }
+
+    const wsSeenMessages = new Map();
+    function makeWsDedupKey(source, channelText) {
+      if (!source || typeof source !== "object") return "";
+      const msgId = source.id ?? source.message_id ?? source.notification_id;
+      const createdAt = source.created_at || source.date_created || "";
+      const chatUid = source.chat_uid || "";
+      const type = source.message_type || "";
+      if (msgId || createdAt || chatUid) {
+        return `${channelText}::${msgId || ""}::${chatUid || ""}::${createdAt || ""}::${type || ""}`;
+      }
+      return "";
+    }
+
+    function shouldEmitWsEvent(source, channelText) {
+      const key = makeWsDedupKey(source, channelText);
+      if (!key) return true;
+      const now = Date.now();
+      const last = wsSeenMessages.get(key);
+      if (last && now - last < 5000) return false;
+      wsSeenMessages.set(key, now);
+      if (wsSeenMessages.size > 5000) {
+        const cutoff = now - 300000;
+        for (const [k, ts] of wsSeenMessages.entries()) {
+          if (ts < cutoff) wsSeenMessages.delete(k);
+        }
+      }
+      return true;
+    }
+
+    function handleSocketPayload(message) {
+      if (!message || typeof message !== "object") return;
+      const channel = Array.isArray(message) ? message[0] : "";
+      const payload =
+        Array.isArray(message) && message.length > 1 ? message[1] : message;
+      if (!payload || typeof payload !== "object") return;
+      const channelText = String(channel || "");
+      const source =
+        payload.message_object && typeof payload.message_object === "object"
+          ? payload.message_object
+          : payload;
+      const action = String(extractFirstValue(payload, ["action"]) || "").toLowerCase();
+      // Special mail socket shape: action=mail/read_mail with IDs only.
+      if (action === "mail" || action === "read_mail") {
+        const femaleIdRaw = extractFirstValue(payload, ["female_id", "femaleId"]);
+        const maleExternalRaw = extractFirstValue(payload, [
+          "male_external_id",
+          "maleExternalId",
+        ]);
+        const femaleId = String(femaleIdRaw || "").replace(/\D/g, "");
+        const maleExternalId = String(maleExternalRaw || "").replace(/\D/g, "");
+        if (femaleId && maleExternalId) {
+          postWsEvent({
+            action,
+            female_id: femaleId,
+            male_external_id: maleExternalId,
+            created_at:
+              extractFirstValue(payload, ["updated_limit_at", "updatedAt"]) ||
+              new Date().toISOString(),
+          });
+        }
+        return;
+      }
+      const payedVal = extractFirstValue(source, ["payed", "paid"]);
+      const payed = Number(payedVal);
+      if (!Number.isFinite(payed) || payed <= 0) return;
+      const messageType = extractFirstValue(source, [
+        "message_type",
+        "messageType",
+      ]);
+      const createdAt = extractFirstValue(source, [
+        "created_at",
+        "date_created",
+        "createdAt",
+      ]);
+      const chatUid = extractFirstValue(source, ["chat_uid", "chatUid"]);
+      if (!messageType || !createdAt || !chatUid) return;
+      if (!shouldEmitWsEvent(source, channelText)) return;
+      postWsEvent({
+        message_type: messageType,
+        created_at: createdAt,
+        chat_uid: chatUid,
+      });
+    }
+
+    function parseSocketIoMessage(text) {
+      if (typeof text !== "string") return null;
+      const trimmed = text.trim();
+      if (!trimmed.startsWith("42")) return null;
+      const json = trimmed.slice(2);
+      if (!json) return null;
+      try {
+        return JSON.parse(json);
+      } catch {
+        return null;
+      }
+    }
+
+    function handleSocketData(data) {
+      try {
+        if (typeof data === "string") {
+          const parsed = parseSocketIoMessage(data);
+          if (Array.isArray(parsed) && parsed.length >= 2) {
+            handleSocketPayload(parsed);
+          }
+          return;
+        }
+        if (typeof ArrayBuffer !== "undefined" && data instanceof ArrayBuffer) {
+          try {
+            const text = new TextDecoder("utf-8").decode(new Uint8Array(data));
+            const parsed = parseSocketIoMessage(text);
+            if (Array.isArray(parsed) && parsed.length >= 2) {
+              handleSocketPayload(parsed);
+            }
+          } catch {}
+          return;
+        }
+        if (typeof Blob !== "undefined" && data instanceof Blob) {
+          if (typeof data.text === "function") {
+            data
+              .text()
+              .then((text) => {
+                const parsed = parseSocketIoMessage(text);
+                if (Array.isArray(parsed) && parsed.length >= 2) {
+                  handleSocketPayload(parsed);
+                }
+              })
+              .catch(() => {});
+          }
+        }
+      } catch {}
+    }
+
+    function extractMessageIdCount(data, seen = new WeakSet()) {
+      if (!data || typeof data !== "object") return 0;
+      if (seen.has(data)) return 0;
+      seen.add(data);
+      if (Array.isArray(data)) {
+        for (const item of data) {
+          const found = extractMessageIdCount(item, seen);
+          if (found) return found;
+        }
+        return 0;
+      }
+      const directKeys = ["message_id", "message_ids", "messageId", "messageIds"];
+      for (const key of directKeys) {
+        if (Object.prototype.hasOwnProperty.call(data, key)) {
+          const value = data[key];
+          if (Array.isArray(value)) return value.length;
+          if (value == null || value === "") return 0;
+          return 1;
+        }
+      }
+      for (const value of Object.values(data)) {
+        const found = extractMessageIdCount(value, seen);
+        if (found) return found;
+      }
+      return 0;
     }
 
     function evaluatePayload(payload, kind, profileHint) {
@@ -278,7 +472,11 @@
             ? extractProfileIdFromData(data, kind)
             : "";
         const profileId = profileFromPayload || profileHint || "";
-        const count = kind === "mail" ? extractMailCount(data) : 1;
+        let count = 1;
+        if (kind === "mail" && data && typeof data === "object") {
+          const msgCount = extractMessageIdCount(data);
+          count = msgCount > 0 ? msgCount : 1;
+        }
         notify(kind, profileId, count);
       }
     }
@@ -391,7 +589,73 @@
       };
     }
 
+    function hookWebSocket() {
+      if (typeof window.WebSocket !== "function") return;
+      const OriginalWebSocket = window.WebSocket;
+      if (!OriginalWebSocket.__ot4et_onmessage_patched) {
+        try {
+          const desc = Object.getOwnPropertyDescriptor(
+            OriginalWebSocket.prototype,
+            "onmessage"
+          );
+          if (desc && typeof desc.set === "function" && typeof desc.get === "function") {
+            Object.defineProperty(OriginalWebSocket.prototype, "onmessage", {
+              configurable: true,
+              enumerable: true,
+              get() {
+                return this.__ot4et_onmessage_handler || null;
+              },
+              set(handler) {
+                this.__ot4et_onmessage_handler = handler;
+                const wrapped = typeof handler === "function"
+                  ? function wrappedOnMessage(ev) {
+                      try {
+                        handleSocketData(ev?.data);
+                      } catch {}
+                      return handler.call(this, ev);
+                    }
+                  : null;
+                try {
+                  return desc.set.call(this, wrapped);
+                } catch {
+                  return desc.set.call(this, handler);
+                }
+              },
+            });
+            OriginalWebSocket.__ot4et_onmessage_patched = true;
+          }
+        } catch {}
+      }
+      if (!OriginalWebSocket.__ot4et_dispatch_patched) {
+        try {
+          const originalDispatch = OriginalWebSocket.prototype.dispatchEvent;
+          OriginalWebSocket.prototype.dispatchEvent = function patchedDispatch(event) {
+            try {
+              if (event?.type === "message") {
+                handleSocketData(event?.data);
+              }
+            } catch {}
+            return originalDispatch.call(this, event);
+          };
+          OriginalWebSocket.__ot4et_dispatch_patched = true;
+        } catch {}
+      }
+      window.WebSocket = function PatchedWebSocket(url, protocols) {
+        const ws =
+          protocols !== undefined
+            ? new OriginalWebSocket(url, protocols)
+            : new OriginalWebSocket(url);
+        return ws;
+      };
+      window.WebSocket.prototype = OriginalWebSocket.prototype;
+      window.WebSocket.OPEN = OriginalWebSocket.OPEN;
+      window.WebSocket.CLOSED = OriginalWebSocket.CLOSED;
+      window.WebSocket.CLOSING = OriginalWebSocket.CLOSING;
+      window.WebSocket.CONNECTING = OriginalWebSocket.CONNECTING;
+    }
+
     hookFetch();
     hookXhr();
+    hookWebSocket();
   } catch {}
 })();

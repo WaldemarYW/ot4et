@@ -21,6 +21,11 @@
   "content_scripts": [
     {
       "matches": ["https://alpha.date/*"],
+      "js": ["wsEarlyInject.js"],
+      "run_at": "document_start"
+    },
+    {
+      "matches": ["https://alpha.date/*"],
       "js": ["content.js"],
       "run_at": "document_idle"
     }

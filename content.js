@@ -322,6 +322,8 @@ function notifyMonitorRecord(kind, profileId, count) {
 
 let monitorBridgeInitialized = false;
 let senderListBridgeInitialized = false;
+let wsEventBridgeInitialized = false;
+let wsEventQueue = [];
 
 function handleMonitorBridgeMessage(event) {
   try {
@@ -359,11 +361,102 @@ function handleSenderListBridgeMessage(event) {
   } catch {}
 }
 
+function findChatUidInPayload(payload) {
+  if (!payload) return "";
+  if (typeof payload === "string") return payload.trim();
+  if (Array.isArray(payload)) {
+    for (const item of payload) {
+      const found = findChatUidInPayload(item);
+      if (found) return found;
+    }
+    return "";
+  }
+  if (typeof payload !== "object") return "";
+  const direct =
+    payload.chat_uid ||
+    payload.chatUid ||
+    payload.uid ||
+    payload.chatUID ||
+    "";
+  if (typeof direct === "string" && direct.trim()) return direct.trim();
+  return findChatUidInPayload(payload.response || payload.data || null);
+}
+
+async function resolveMailChatUidFromSocket(payload) {
+  const femaleId = String(payload?.female_id || "").replace(/\D/g, "");
+  const maleExternalId = String(payload?.male_external_id || "").replace(/\D/g, "");
+  if (!femaleId || !maleExternalId) return "";
+  const token = getAuthTokenFromStorage();
+  if (!token) return "";
+  try {
+    const response = await profileSwitchRequest({
+      url: CHAT_UID_LOOKUP_URL,
+      method: "POST",
+      token,
+      body: {
+        user_external_id: Number(maleExternalId),
+        woman_external_id: Number(femaleId),
+      },
+    });
+    return findChatUidInPayload(response);
+  } catch {
+    return "";
+  }
+}
+
+function handleWsEventBridgeMessage(event) {
+  try {
+    if (!event || event.source !== window) return;
+    const data = event.data;
+    if (!data || data.type !== "OT4ET_WS_EVENT") return;
+    const payload = data.payload;
+    if (!payload || typeof payload !== "object") return;
+    const socketAction = String(payload.action || "").toLowerCase();
+    if (
+      (socketAction === "mail" || socketAction === "read_mail") &&
+      payload.female_id &&
+      payload.male_external_id
+    ) {
+      resolveMailChatUidFromSocket(payload)
+        .then((chatUid) => {
+          if (!chatUid) return;
+          const item = {
+            message_type: socketAction === "read_mail" ? "READ_MAIL" : "SENT_MAIL",
+            created_at: payload.created_at || new Date().toISOString(),
+            chat_uid: chatUid,
+          };
+          const monitor = ui?.balanceMonitor;
+          if (monitor && typeof monitor.addWsEvent === "function") {
+            monitor.addWsEvent(item);
+            return;
+          }
+          wsEventQueue.push(item);
+        })
+        .catch(() => {});
+      return;
+    }
+    const monitor = ui?.balanceMonitor;
+    if (monitor && typeof monitor.addWsEvent === "function") {
+      monitor.addWsEvent(payload);
+      return;
+    }
+    wsEventQueue.push(payload);
+  } catch {}
+}
+
 function setupSenderListMessageBridge() {
   if (senderListBridgeInitialized) return;
   senderListBridgeInitialized = true;
   try {
     window.addEventListener("message", handleSenderListBridgeMessage);
+  } catch {}
+}
+
+function setupWsEventMessageBridge() {
+  if (wsEventBridgeInitialized) return;
+  wsEventBridgeInitialized = true;
+  try {
+    window.addEventListener("message", handleWsEventBridgeMessage);
   } catch {}
 }
 
@@ -420,6 +513,7 @@ function injectMonitorNetworkHooks() {
 injectMonitorNetworkHooks();
 setupMonitorMessageBridge();
 setupSenderListMessageBridge();
+setupWsEventMessageBridge();
 hydrateSenderListFromStorage();
 
 
@@ -481,6 +575,8 @@ function createBalanceMonitorWidget() {
   let fullDayRows = [];
   let fullDayTotal = 0;
   let lastBalanceDate = "";
+  let wsEvents = [];
+  let wsEventsDayKey = "";
 
   const widget = document.createElement("div");
   widget.id = "adb-panel";
@@ -493,7 +589,41 @@ function createBalanceMonitorWidget() {
     </div>
     <div id="adb-details" aria-hidden="true" inert>
       <div class="adb-tools"></div>
-      <div id="adb-list"></div>
+      <div class="adb-tabs" role="tablist" aria-label="ADB details tabs">
+        <button
+          id="adb-tab-balance"
+          class="adb-tab active"
+          type="button"
+          role="tab"
+          aria-selected="true"
+          aria-controls="adb-panel-balance"
+        >Баланс</button>
+        <button
+          id="adb-tab-webhooks"
+          class="adb-tab"
+          type="button"
+          role="tab"
+          aria-selected="false"
+          aria-controls="adb-panel-webhooks"
+        >Webhooks</button>
+      </div>
+      <div
+        id="adb-panel-balance"
+        class="adb-tab-panel"
+        role="tabpanel"
+        aria-labelledby="adb-tab-balance"
+      >
+        <div id="adb-list"></div>
+      </div>
+      <div
+        id="adb-panel-webhooks"
+        class="adb-tab-panel"
+        role="tabpanel"
+        aria-labelledby="adb-tab-webhooks"
+        hidden
+      >
+        <div id="adb-webhook-list"></div>
+      </div>
     </div>
   `;
 
@@ -504,9 +634,15 @@ function createBalanceMonitorWidget() {
     details: widget.querySelector("#adb-details"),
     total: widget.querySelector("#adb-total"),
     list: widget.querySelector("#adb-list"),
+    webhooksList: widget.querySelector("#adb-webhook-list"),
+    tabBalance: widget.querySelector("#adb-tab-balance"),
+    tabWebhooks: widget.querySelector("#adb-tab-webhooks"),
+    panelBalance: widget.querySelector("#adb-panel-balance"),
+    panelWebhooks: widget.querySelector("#adb-panel-webhooks"),
   };
 
   let detailsOpen = false;
+  let activeTab = "balance";
   let listHeightPx = null;
   let listHeightLimitPx = null;
   let maxContainerHeightPx = null;
@@ -514,6 +650,8 @@ function createBalanceMonitorWidget() {
   let pointerOffsetPx = null;
   let latestSeenTimestamp = 0;
   let balanceFresh = false;
+  let wsEventsFresh = false;
+  let wsFreshTimerId = null;
   let renderedKeysAtMaxTs = new Set();
   let seenKeysAtLatestTs = new Set();
 
@@ -527,7 +665,7 @@ function createBalanceMonitorWidget() {
 
   function applyListHeight() {
     try {
-      if (!elements?.list) return;
+      if (!elements?.list && !elements?.webhooksList) return;
       let target = null;
       if (Number.isFinite(listHeightPx) && listHeightPx > 0) {
         target = listHeightPx;
@@ -538,13 +676,27 @@ function createBalanceMonitorWidget() {
       }
       if (Number.isFinite(target) && target > 0) {
         const clamp = Math.max(1, Math.round(target));
-        elements.list.style.height = `${clamp}px`;
-        elements.list.style.maxHeight = `${clamp}px`;
-        elements.list.style.minHeight = `${clamp}px`;
+        if (elements.list) {
+          elements.list.style.height = `${clamp}px`;
+          elements.list.style.maxHeight = `${clamp}px`;
+          elements.list.style.minHeight = `${clamp}px`;
+        }
+        if (elements.webhooksList) {
+          elements.webhooksList.style.height = `${clamp}px`;
+          elements.webhooksList.style.maxHeight = `${clamp}px`;
+          elements.webhooksList.style.minHeight = `${clamp}px`;
+        }
       } else {
-        elements.list.style.height = "";
-        elements.list.style.maxHeight = "";
-        elements.list.style.minHeight = "";
+        if (elements.list) {
+          elements.list.style.height = "";
+          elements.list.style.maxHeight = "";
+          elements.list.style.minHeight = "";
+        }
+        if (elements.webhooksList) {
+          elements.webhooksList.style.height = "";
+          elements.webhooksList.style.maxHeight = "";
+          elements.webhooksList.style.minHeight = "";
+        }
       }
     } catch {}
   }
@@ -641,7 +793,31 @@ function createBalanceMonitorWidget() {
     } catch {}
   }
 
-function setDetailsOpen(open) {
+  function switchTab(tabKey) {
+    const next = tabKey === "webhooks" ? "webhooks" : "balance";
+    activeTab = next;
+    const balanceActive = next === "balance";
+    if (elements.tabBalance) {
+      elements.tabBalance.classList.toggle("active", balanceActive);
+      elements.tabBalance.setAttribute("aria-selected", balanceActive ? "true" : "false");
+    }
+    if (elements.tabWebhooks) {
+      elements.tabWebhooks.classList.toggle("active", !balanceActive);
+      elements.tabWebhooks.setAttribute("aria-selected", !balanceActive ? "true" : "false");
+    }
+    if (elements.panelBalance) {
+      elements.panelBalance.hidden = !balanceActive;
+    }
+    if (elements.panelWebhooks) {
+      elements.panelWebhooks.hidden = balanceActive;
+    }
+    if (!balanceActive && detailsOpen) {
+      markWsEventsSeen();
+    }
+    applyListHeight();
+  }
+
+  function setDetailsOpen(open) {
     const nextOpen = !!open;
     if (nextOpen) {
       closeUserInfoMenu();
@@ -664,35 +840,44 @@ function setDetailsOpen(open) {
       elements.toggle.setAttribute("aria-expanded", detailsOpen ? "true" : "false");
       elements.toggle.title = detailsOpen ? "Скрыть детали" : "Показать детали";
     }
-  if (detailsOpen) {
-    applyListHeight();
-    applyDetailsBounds();
-    applyPointerOffset();
-    applyMaxContainerHeight();
-    const raf = typeof requestAnimationFrame === "function"
-      ? requestAnimationFrame
-      : (cb) => setTimeout(cb, 0);
-    raf(() => {
-      try {
-        updateLabelScrolling();
-      } catch (e) {
-        LOG.warn("Balance monitor: updateLabelScrolling failed", e);
+    if (detailsOpen) {
+      if (wsFreshTimerId) {
+        clearTimeout(wsFreshTimerId);
+        wsFreshTimerId = null;
       }
-    });
-    markAllSeen({ clearRows: false });
-  } else if (wasOpen) {
-    markAllSeen({ clearRows: true });
+      applyListHeight();
+      applyDetailsBounds();
+      applyPointerOffset();
+      applyMaxContainerHeight();
+      const raf = typeof requestAnimationFrame === "function"
+        ? requestAnimationFrame
+        : (cb) => setTimeout(cb, 0);
+      raf(() => {
+        try {
+          updateLabelScrolling();
+        } catch (e) {
+          LOG.warn("Balance monitor: updateLabelScrolling failed", e);
+        }
+      });
+      markAllSeen({ clearRows: false });
+      wsFreshTimerId = setTimeout(() => {
+        wsFreshTimerId = null;
+        wsEventsFresh = false;
+        applyWsFreshState();
+        markWsEventsSeen();
+      }, 10000);
+    } else if (wasOpen) {
+      markAllSeen({ clearRows: true });
+    }
   }
-}
 
-elements.toggle?.setAttribute("aria-controls", "adb-details");
-
-setDetailsOpen(false);
-applyBalanceFreshState();
+  elements.toggle?.setAttribute("aria-controls", "adb-details");
 
   elements.toggle?.addEventListener("click", () => {
     setDetailsOpen(!detailsOpen);
   });
+  elements.tabBalance?.addEventListener("click", () => switchTab("balance"));
+  elements.tabWebhooks?.addEventListener("click", () => switchTab("webhooks"));
 
   function renderGroupedRows(items) {
     if (!elements.list) return 0;
@@ -807,11 +992,129 @@ applyBalanceFreshState();
     return 0;
   }
 
+  function formatWsTime(value) {
+    if (!value) return "";
+    const date = value instanceof Date ? value : new Date(value);
+    if (Number.isNaN(date.getTime())) return "";
+    try {
+      return date.toLocaleTimeString(undefined, {
+        hour: "2-digit",
+        minute: "2-digit",
+      });
+    } catch {
+      return date.toTimeString().slice(0, 5);
+    }
+  }
+
+  function buildWsLink(messageType, chatUid) {
+    if (!chatUid) return "";
+    const type = String(messageType || "").toLowerCase();
+    const base = type.includes("mail")
+      ? "https://alpha.date/letter/"
+      : "https://alpha.date/chat/";
+    return `${base}${encodeURIComponent(chatUid)}`;
+  }
+
+  function renderWsEvents() {
+    if (!elements.webhooksList) return;
+    if (!wsEvents.length) {
+      elements.webhooksList.innerHTML =
+        '<div class="adb-empty">Нет webhook-событий</div>';
+      return;
+    }
+    const rows = wsEvents
+      .map((item) => {
+        const messageType = String(item?.message_type || "").trim();
+        const createdAt = item?.created_at || "";
+        const chatUid = String(item?.chat_uid || "").trim();
+        if (!messageType || !chatUid) return "";
+        const timeLabel = formatWsTime(createdAt);
+        const safeType = escapeHtml(messageType);
+        const safeTime = escapeHtml(timeLabel || "");
+        const link = buildWsLink(messageType, chatUid);
+        const safeHref = escapeHtml(link);
+        const rowClass = item?.seen ? "adb-row" : "adb-row new";
+        return `
+          <a class="${rowClass}" href="${safeHref}" target="_blank" rel="noopener" title="${safeType}">
+            <span class="adb-time">${safeTime}</span>
+            <span class="adb-label"><span class="adb-label-inner">${safeType}</span></span>
+          </a>
+        `.trim();
+      })
+      .filter(Boolean)
+      .join("");
+    elements.webhooksList.innerHTML = rows || '<div class="adb-empty">Нет webhook-событий</div>';
+    updateLabelScrolling();
+  }
+
+  function persistWsEventsCache() {
+    try {
+      const payload = {
+        dayKey: wsEventsDayKey || getKyivDayKey(),
+        items: wsEvents,
+      };
+      setStore({
+        [WS_EVENTS_STORAGE_KEY]: payload,
+      });
+      try {
+        window?.localStorage?.setItem?.(
+          WS_EVENTS_FALLBACK_STORAGE_KEY,
+          JSON.stringify(payload)
+        );
+      } catch {}
+    } catch {}
+  }
+
+  function ensureWsEventsDayKey() {
+    const currentKey = getKyivDayKey();
+    if (!wsEventsDayKey) {
+      wsEventsDayKey = currentKey;
+      return;
+    }
+    if (wsEventsDayKey !== currentKey) {
+      wsEventsDayKey = currentKey;
+      wsEvents = [];
+      renderWsEvents();
+      persistWsEventsCache();
+    }
+  }
+
+  async function loadWsEventsCache() {
+    try {
+      const store = await getStore([WS_EVENTS_STORAGE_KEY]);
+      let cached = store[WS_EVENTS_STORAGE_KEY];
+      if (!cached || typeof cached !== "object") {
+        try {
+          const raw = window?.localStorage?.getItem?.(WS_EVENTS_FALLBACK_STORAGE_KEY);
+          if (raw) {
+            const parsed = JSON.parse(raw);
+            if (parsed && typeof parsed === "object") {
+              cached = parsed;
+            }
+          }
+        } catch {}
+      }
+      const todayKey = getKyivDayKey();
+      if (cached && typeof cached === "object" && cached.dayKey === todayKey) {
+        wsEventsDayKey = cached.dayKey;
+        wsEvents = Array.isArray(cached.items) ? cached.items : [];
+        renderWsEvents();
+        return;
+      }
+      wsEventsDayKey = todayKey;
+      wsEvents = [];
+      renderWsEvents();
+      persistWsEventsCache();
+    } catch {
+      renderWsEvents();
+    }
+  }
+
   function updateLabelScrolling() {
     try {
-      if (!elements.list) return;
+      if (!elements.details) return;
       const apply = () => {
-        elements.list.querySelectorAll(".adb-label").forEach((label) => {
+        elements.details.querySelectorAll(".adb-label").forEach((label) => {
           const inner = label.querySelector(".adb-label-inner");
           if (!inner) return;
           delete label.dataset.scrollable;
@@ -993,6 +1296,27 @@ applyBalanceFreshState();
     } catch {}
   }
 
+  function applyWsFreshState() {
+    try {
+      if (!elements.total) return;
+      if (wsEventsFresh) elements.total.classList.add("ws-fresh");
+      else elements.total.classList.remove("ws-fresh");
+    } catch {}
+  }
+
+  function markWsEventsSeen() {
+    let changed = false;
+    wsEvents = wsEvents.map((item) => {
+      if (!item || item.seen) return item;
+      changed = true;
+      return { ...item, seen: true };
+    });
+    if (changed) {
+      renderWsEvents();
+      persistWsEventsCache();
+    }
+  }
+
 
   function hasUnseenRows(newestTs) {
     if (!newestTs || latestSeenTimestamp === 0) return false;
@@ -1023,13 +1347,22 @@ applyBalanceFreshState();
       } catch {}
     }
   }
+  setDetailsOpen(false);
+  switchTab("webhooks");
+  applyBalanceFreshState();
+  applyWsFreshState();
   syncLogoWhiteSquareBalanceFromWidget();
+  void loadWsEventsCache();
   startPolling();
 
   return {
     element: widget,
     destroy() {
       stopPolling();
+      if (wsFreshTimerId) {
+        clearTimeout(wsFreshTimerId);
+        wsFreshTimerId = null;
+      }
     },
     setListHeight,
     setListHeightLimit,
@@ -1037,6 +1370,30 @@ applyBalanceFreshState();
     setPointerOffset,
     setMaxContainerHeight,
     closeDetails: () => setDetailsOpen(false),
+    switchTab,
+    addWsEvent(eventPayload) {
+      try {
+        if (!eventPayload || typeof eventPayload !== "object") return;
+        const messageType = String(eventPayload.message_type || "").trim();
+        const createdAt = eventPayload.created_at || "";
+        const chatUid = String(eventPayload.chat_uid || "").trim();
+        if (!messageType || !chatUid) return;
+        ensureWsEventsDayKey();
+        wsEvents.unshift({
+          message_type: messageType,
+          created_at: createdAt,
+          chat_uid: chatUid,
+          seen: false,
+        });
+        if (wsEvents.length > 200) {
+          wsEvents = wsEvents.slice(0, 200);
+        }
+        renderWsEvents();
+        wsEventsFresh = true;
+        applyWsFreshState();
+        persistWsEventsCache();
+      } catch {}
+    },
   };
 }
 
@@ -1096,6 +1453,8 @@ const LETTERS_NAV_SELECTOR =
 const LETTERS_NEW_WINDOW_STORAGE_KEY = "lettersOpenInNewWindow";
 const LETTERS_OPEN_HOTKEY_STORAGE_KEY = "lettersOpenHotkey";
 const LETTERS_OPEN_HOTKEY_DEFAULT = "ctrl+l";
+const CHAT_UID_LOOKUP_URL =
+  "https://alpha.date/api/chatList/chatUidByProfileAndUserIds";
 
 function getMsgContainer() {
   try {
@@ -2550,6 +2909,9 @@ const MONITOR_GOAL_STORAGE_KEY = "monitorGoalTarget";
 const HOURLY_GOAL_MIN = 100;
 const MONITOR_COUNTER_RESET_HOUR = 2; // 02:00 Kyiv time
 const REPORTS_SHIFT_RESET_HOUR = 23; // 23:00 Kyiv time (reports only)
+const WS_EVENTS_STORAGE_KEY = "ot4et_ws_events";
+const WS_EVENTS_FALLBACK_STORAGE_KEY = "__ot4et_ws_events__";
+const ADMIN_READONLY_LATCH_STORAGE_KEY = "__ot4et_admin_readonly_latch__";
 const LOGO_WHITE_SQUARE_PROFILES_STORAGE_KEY = "logoProfilesCache";
 const LOGO_WHITE_SQUARE_BALANCE_STORAGE_KEY = "logoBalanceCache";
 const monitorCounterState = {
@@ -2663,6 +3025,11 @@ let lettersOpenHotkey = LETTERS_OPEN_HOTKEY_DEFAULT;
 let lettersOpenHotkeyParsed = null;
 let settingsMenuOpen = false;
 let settingsMenuCleanup = null;
+let adminReadOnlyLatched = false;
+try {
+  adminReadOnlyLatched =
+    window?.sessionStorage?.getItem?.(ADMIN_READONLY_LATCH_STORAGE_KEY) === "1";
+} catch {}
 
 async function loadUserInfoModule() {
   if (!userInfoModulePromise) {
@@ -3350,6 +3717,7 @@ function enqueueProfileShiftDelta(entries) {
 }
 
 async function flushProfileShiftDeltaQueue() {
+  if (isAdminUniversalProfileContainerPresent()) return;
   if (!profileShiftDeltaQueue.length) return;
   const base = await getProfileStatsApiBase();
   if (!base) return;
@@ -3649,6 +4017,7 @@ function enqueueOperatorShiftSnapshot(entry) {
 }
 
 async function flushOperatorShiftSnapshotQueue() {
+  if (isAdminUniversalProfileContainerPresent()) return;
   if (!operatorShiftSnapshotQueue.length) return;
   const base = await getProfileStatsApiBase();
   if (!base) return;
@@ -6051,6 +6420,15 @@ async function refreshLogoWhiteSquareProfiles() {
     logoWhiteSquareProfilesState.items = nextItems;
     logoWhiteSquareProfilesState.error = "";
     persistLogoWhiteSquareProfilesCache();
+    try {
+      const ids = (Array.isArray(nextItems) ? nextItems : [])
+        .map((item) => normalizeProfileExternalId(item?.externalId))
+        .filter(Boolean);
+      window?.localStorage?.setItem?.(
+        "__ot4et_profile_ids__",
+        JSON.stringify(ids)
+      );
+    } catch {}
   } catch (err) {
     logoWhiteSquareProfilesState.items = logoWhiteSquareProfilesState.items || [];
     logoWhiteSquareProfilesState.error =
@@ -6070,6 +6448,15 @@ async function loadLogoWhiteSquareProfilesCache() {
     if (cached && Array.isArray(cached.items)) {
       logoWhiteSquareProfilesState.items = cached.items;
       logoWhiteSquareProfilesState.error = "";
+      try {
+        const ids = cached.items
+          .map((item) => normalizeProfileExternalId(item?.externalId))
+          .filter(Boolean);
+        window?.localStorage?.setItem?.(
+          "__ot4et_profile_ids__",
+          JSON.stringify(ids)
+        );
+      } catch {}
       if (cached.ts) lastProfilesRefreshAt = Number(cached.ts) || lastProfilesRefreshAt;
       const cachedIds = new Set(
         cached.items
@@ -7528,11 +7915,63 @@ function updateOperatorInfoUI() {
   updateOperatorNameUI();
 }
 
-function isAdminUniversalProfileContainerPresent() {
+function activateAdminReadOnlyMode() {
+  if (adminReadOnlyLatched) return;
+  adminReadOnlyLatched = true;
   try {
-    return !!document.querySelector('[class*="styles_options_selectors_container__"]');
+    window?.sessionStorage?.setItem?.(ADMIN_READONLY_LATCH_STORAGE_KEY, "1");
+  } catch {}
+  try {
+    profileShiftDeltaQueue = [];
+    persistProfileShiftDeltaQueue();
+  } catch {}
+  try {
+    operatorShiftSnapshotQueue = [];
+    persistOperatorShiftSnapshotQueue();
+  } catch {}
+}
+
+function detectSuperAdminMenuPresence() {
+  try {
+    const hasSuperRoot = !!document.querySelector(
+      [
+        '[class*="SuperOperatorsSelect_options_selectors_container__"]',
+        '[class*="SuperOperatorsSelect_options_list__"]',
+        '[class*="SuperOperatorsSelect_shift_filter_options__"]',
+      ].join(",")
+    );
+    if (!hasSuperRoot) return false;
+    const hasMainComboInput = !!document.querySelector("input#combo-box[role=\"combobox\"]");
+    const hasSearchOperatorLabel = Array.from(
+      document.querySelectorAll("label[for=\"combo-box\"]")
+    ).some((node) =>
+      /search\s*operator\s*id/i.test(String(node?.textContent || "").trim())
+    );
+    return hasMainComboInput || hasSearchOperatorLabel;
   } catch {
     return false;
+  }
+}
+
+function isAdminUniversalProfileContainerPresent() {
+  if (adminReadOnlyLatched) return true;
+  try {
+    const hasSuperAdminMenu = detectSuperAdminMenuPresence();
+    const hasLegacyAdminContainer = !!document.querySelector(
+      '[class*="styles_options_selectors_container__"]'
+    );
+    const hasGenericSelectorsContainer = !!document.querySelector(
+      '[class*="options_selectors_container__"]'
+    );
+    const isAdmin =
+      hasSuperAdminMenu || hasLegacyAdminContainer || hasGenericSelectorsContainer;
+    if (isAdmin) {
+      activateAdminReadOnlyMode();
+      return true;
+    }
+    return false;
+  } catch {
+    return adminReadOnlyLatched;
   }
 }
 
@@ -9466,16 +9905,26 @@ function buildPanel() {
       #adb-toggle:focus-visible{outline:2px solid rgba(95,168,255,0.6)}
       #adb-total{font-size:28px;color:#2b7a78;line-height:1}
       #adb-total.fresh{color:#1aa859}
+      #adb-total.ws-fresh{color:#1aa859}
       #adb-chevron{font-size:16px;color:inherit;transition:transform .2s ease}
       #adb-header.open #adb-chevron{transform:rotate(180deg)}
       #adb-details{position:absolute;top:calc(100% + 8px);left:0;z-index:6;display:flex;flex-direction:column;gap:4px;padding:8px;border-radius:3px;border:1px solid rgba(31,79,116,0.15);background:var(--ar-elevated-bg, ${PANEL_ELEVATED_BG});box-shadow:0 10px 28px rgba(31,79,116,0.18);opacity:0;transform:translateY(-6px);pointer-events:none;transition:opacity .12s ease, transform .12s ease;box-sizing:border-box;overflow:hidden}
       #adb-details::before{content:"";position:absolute;top:-6px;left:var(--adb-pointer-left, 30px);width:12px;height:12px;background:inherit;border-left:1px solid rgba(31,79,116,0.15);border-top:1px solid rgba(31,79,116,0.15);transform:rotate(45deg);pointer-events:none}
       #adb-details.open{opacity:1;transform:translateY(0);pointer-events:auto}
       #adb-details .adb-tools{display:flex;align-items:center;gap:12px;justify-content:flex-end;width:100%}
+      #adb-details .adb-tabs{display:flex;align-items:center;gap:6px;margin:2px 0 4px}
+      #adb-details .adb-tab{appearance:none;border:1px solid rgba(31,79,116,0.18);background:rgba(95,168,255,0.08);color:inherit;border-radius:3px;padding:2px 8px;font:12px/1.3 Consolas, monospace;cursor:pointer}
+      #adb-details .adb-tab:hover{background:rgba(95,168,255,0.14)}
+      #adb-details .adb-tab.active{background:rgba(95,168,255,0.2);border-color:rgba(31,79,116,0.28)}
+      #adb-details .adb-tab:focus-visible{outline:2px solid rgba(95,168,255,0.55);outline-offset:1px}
+      #adb-details .adb-tab-panel{display:block}
+      #adb-details .adb-tab-panel[hidden]{display:none !important}
       #adb-details .adb-actions{display:flex;align-items:center;gap:8px}
       #adb-details .adb-tools button{background:none;border:none;border-radius:3px;padding:0 4px;font-size:20px;line-height:1;color:inherit;cursor:pointer}
       #adb-details .adb-tools button:hover{opacity:0.7}
       #adb-list{margin:0;line-height:17px;tab-size:4;color:inherit;font:14px/18px Consolas, monospace;max-height:360px;overflow:auto;flex:1 1 auto}
+      #adb-webhook-list{margin:0;line-height:17px;tab-size:4;color:inherit;font:14px/18px Consolas, monospace;max-height:360px;overflow:auto;flex:1 1 auto}
+      #adb-webhook-list .adb-empty{opacity:0.7;padding:6px 2px}
       .adb-pie-wrap{display:flex;flex-direction:column;gap:10px;align-items:center}
       .adb-pie{width:120px;height:120px;flex:0 0 auto}
       .adb-legend{display:flex;flex-direction:column;gap:6px;min-width:0;width:100%}
@@ -9972,6 +10421,15 @@ function buildPanel() {
       ui.balanceHost.appendChild(balanceMonitor.element);
       ui.balanceMonitor = balanceMonitor;
       syncBalancePanelLayout();
+      if (wsEventQueue.length && typeof balanceMonitor.addWsEvent === "function") {
+        const queued = wsEventQueue.slice();
+        wsEventQueue = [];
+        queued.forEach((item) => {
+          try {
+            balanceMonitor.addWsEvent(item);
+          } catch {}
+        });
+      }
     }
   } catch (err) {
     LOG.error("Balance monitor init failed", err);
