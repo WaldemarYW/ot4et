@@ -318,7 +318,12 @@ function notifyMonitorRecord(kind, profileId, count) {
     if (Number.isFinite(Number(count)) && Number(count) > 0) {
       payload.count = Math.max(1, Math.round(Number(count)));
     }
-    chrome.runtime.sendMessage(payload);
+    chrome.runtime.sendMessage(payload, () => {
+      try {
+        // Prevent noisy "Unchecked runtime.lastError: No SW" when background SW is restarting.
+        void chrome.runtime.lastError;
+      } catch {}
+    });
   } catch {}
 }
 
@@ -1524,6 +1529,21 @@ function createBalanceMonitorWidget() {
     }
   }
 
+  function clearWsEventsForNewDay() {
+    try {
+      wsEventsDayKey = getKyivDayKey();
+      wsEvents = [];
+      wsEventsFresh = false;
+      if (wsFreshTimerId) {
+        clearTimeout(wsFreshTimerId);
+        wsFreshTimerId = null;
+      }
+      renderWsEvents();
+      applyWsFreshState();
+      persistWsEventsCache();
+    } catch {}
+  }
+
 
   function hasUnseenRows(newestTs) {
     if (!newestTs || latestSeenTimestamp === 0) return false;
@@ -1578,6 +1598,7 @@ function createBalanceMonitorWidget() {
     setMaxContainerHeight,
     closeDetails: () => setDetailsOpen(false),
     switchTab,
+    clearWsEventsForNewDay,
     addWsEvent(eventPayload) {
       try {
         if (!eventPayload || typeof eventPayload !== "object") return;
@@ -1672,6 +1693,9 @@ const LETTERS_OPEN_HOTKEY_STORAGE_KEY = "lettersOpenHotkey";
 const LETTERS_OPEN_HOTKEY_DEFAULT = "ctrl+l";
 const PROFILE_PHOTO_HOTKEY_STORAGE_KEY = "profilePhotoHotkey";
 const PROFILE_PHOTO_HOTKEY_DEFAULT = "ctrl+p";
+const OPERATOR_WAIT_SQUARE_MESSAGE = "Включите сендер";
+const OPERATOR_WAIT_MODAL_MESSAGE =
+  "Для начала работы с расширением OT4ET включите сендер";
 const CHAT_UID_LOOKUP_URL =
   "https://alpha.date/api/chatList/chatUidByProfileAndUserIds";
 
@@ -2082,6 +2106,22 @@ function closeAuthModal() {
   } catch {}
 }
 
+function closeOperatorWaitModal() {
+  try {
+    if (!ui?.operatorWaitModal) return;
+    ui.operatorWaitModal.hidden = true;
+    ui.operatorWaitModal.classList.remove("open");
+  } catch {}
+}
+
+function openOperatorWaitModal() {
+  try {
+    if (!ui?.operatorWaitModal) return;
+    ui.operatorWaitModal.hidden = false;
+    ui.operatorWaitModal.classList.add("open");
+  } catch {}
+}
+
 function openAuthModal() {
   try {
     if (!ui?.authModal) return;
@@ -2125,9 +2165,10 @@ async function submitAuthModal() {
       }
       await persistExtensionUnlockState(true);
       extensionLocked = false;
+      setOperatorIdAvailability(hasValidOperatorId(), "submitAuthModal");
       closeAuthModal();
       try {
-        if (!isAlphaLanding()) {
+        if (!isAlphaLanding() && !isUiBlockedByMissingOperatorId()) {
           ui?.drawer?.classList?.add("open");
           drawerManuallyClosed = false;
           fillHeader();
@@ -2153,13 +2194,113 @@ async function submitAuthModal() {
 }
 
 function requireExtensionUnlock() {
-  if (!isExtensionLocked()) return false;
+  if (!isExtensionLocked()) {
+    return requireOperatorIdReady();
+  }
   try {
     ui?.drawer?.classList?.remove("open");
     ui?.moreBox?.classList?.remove("open");
+    closeOperatorWaitModal();
     drawerManuallyClosed = true;
   } catch {}
   openAuthModal();
+  updateLauncherVisibility();
+  return true;
+}
+
+function hasValidOperatorId() {
+  const value = Number(operatorInfoState?.operatorId);
+  return Number.isFinite(value) && value > 0;
+}
+
+function isUiBlockedByMissingOperatorId() {
+  return !isExtensionLocked() && !operatorIdReady;
+}
+
+function updateLogoSquareOperatorWaitState() {
+  const waitMode = isUiBlockedByMissingOperatorId();
+  forEachLogoWhiteSquareCounterNode("counter", (node) => {
+    node.classList.toggle("operator-wait", waitMode);
+    if (waitMode) {
+      node.title = OPERATOR_WAIT_MODAL_MESSAGE;
+    } else {
+      node.removeAttribute("title");
+    }
+  });
+  forEachLogoWhiteSquareCounterNode("total", (node) => {
+    if (waitMode) {
+      node.textContent = OPERATOR_WAIT_SQUARE_MESSAGE;
+      node.title = OPERATOR_WAIT_MODAL_MESSAGE;
+    } else {
+      node.removeAttribute("title");
+    }
+  });
+  forEachLogoWhiteSquareCounterNode("hourValue", (node) => {
+    if (waitMode) {
+      node.textContent = "";
+      node.removeAttribute("title");
+    }
+  });
+}
+
+function setOperatorIdAvailability(nextReady, source = "") {
+  const ready = !!nextReady;
+  const wasWaitMode = operatorIdWaitMode;
+  operatorIdReady = ready;
+  operatorIdWaitMode = !ready;
+  updateLogoSquareOperatorWaitState();
+  if (isExtensionLocked()) {
+    updateLauncherVisibility();
+    return;
+  }
+  if (operatorIdWaitMode) {
+    try {
+      ui?.drawer?.classList?.remove("open");
+      ui?.moreBox?.classList?.remove("open");
+      if (ui?.checkControls) ui.checkControls.hidden = true;
+      if (ui?.openBot) ui.openBot.hidden = true;
+      if (ui?.copyId) ui.copyId.hidden = true;
+      if (ui?.checkOut) ui.checkOut.hidden = true;
+      closeBalanceDetails();
+      closeUserInfoMenu();
+      closeLogoWhiteSquareExpandedPanel();
+      drawerManuallyClosed = true;
+    } catch {}
+    updateLauncherVisibility();
+    return;
+  }
+  closeOperatorWaitModal();
+  try {
+    updateMonitorCounterUI();
+  } catch {}
+  try {
+    scheduleContextRefresh({ immediate: true, force: true });
+  } catch {}
+  if (wasWaitMode && pinned && !isAlphaLanding() && canRenderDrawerInCurrentContext()) {
+    try {
+      ui?.drawer?.classList?.add("open");
+      drawerManuallyClosed = false;
+    } catch {}
+  }
+  updateLauncherVisibility();
+}
+
+function requireOperatorIdReady(options = {}) {
+  if (!isUiBlockedByMissingOperatorId()) return false;
+  const { silent = false } = options || {};
+  try {
+    ui?.drawer?.classList?.remove("open");
+    ui?.moreBox?.classList?.remove("open");
+    closeUserInfoMenu();
+    closeBalanceDetails();
+    closeLogoWhiteSquareExpandedPanel();
+    drawerManuallyClosed = true;
+  } catch {}
+  if (!silent) {
+    try {
+      toast(OPERATOR_WAIT_MODAL_MESSAGE);
+    } catch {}
+  }
   updateLauncherVisibility();
   return true;
 }
@@ -3260,6 +3401,8 @@ let serverAuthCheckPromise = null;
 let serverAuthLastFailureKind = "";
 let serverAuthStateLoaded = false;
 let extensionLocked = true;
+let operatorIdReady = false;
+let operatorIdWaitMode = true;
 let extensionUnlockInFlight = false;
 let extensionUnlockPromise = null;
 let extensionInstallId = "";
@@ -4199,6 +4342,7 @@ function enqueueOperatorShiftSnapshot(entry) {
 }
 
 async function flushOperatorShiftSnapshotQueue() {
+  if (isUiBlockedByMissingOperatorId()) return;
   if (isAdminUniversalProfileContainerPresent()) return;
   if (!operatorShiftSnapshotQueue.length) return;
   const base = await getProfileStatsApiBase();
@@ -4219,6 +4363,7 @@ async function flushOperatorShiftSnapshotQueue() {
 }
 
 async function fetchOperatorShiftSummary() {
+  if (isUiBlockedByMissingOperatorId()) return;
   const operatorId = operatorInfoState.operatorId;
   if (!operatorId) return;
   const base = await getProfileStatsApiBase();
@@ -4297,6 +4442,7 @@ async function fetchOperatorShiftSummary() {
 }
 
 async function sendOperatorShiftSnapshot(balanceTotal) {
+  if (isUiBlockedByMissingOperatorId()) return;
   if (isAdminUniversalProfileContainerPresent()) return;
   const operatorId = operatorInfoState.operatorId;
   if (!operatorId) return;
@@ -4427,6 +4573,7 @@ async function fetchProfileShiftStatsBatch(profileIds) {
 }
 
 async function sendProfileShiftDeltas(profileIds) {
+  if (isUiBlockedByMissingOperatorId()) return;
   if (isAdminUniversalProfileContainerPresent()) return;
   const operatorId = operatorInfoState.operatorId;
   if (!operatorId) return;
@@ -5631,6 +5778,17 @@ function injectLogoWhiteSquareStyles() {
       .${LOGO_WHITE_SQUARE_CLASS} .logo-counter-hour-value{font-size:20px;line-height:1}
       .${LOGO_WHITE_SQUARE_CLASS} .logo-counter-details{display:flex;gap:12px;font-size:12px;flex-wrap:wrap;justify-content:center;width:100%}
       .${LOGO_WHITE_SQUARE_CLASS} .logo-counter-details-hourly{margin-top:2px}
+      .logo-counter.operator-wait .logo-counter-total-row{justify-content:center}
+      .logo-counter.operator-wait .logo-counter-caption,
+      .logo-counter.operator-wait .logo-counter-arrow,
+      .logo-counter.operator-wait .logo-counter-bot,
+      .logo-counter.operator-wait .logo-counter-icon,
+      .logo-counter.operator-wait .logo-counter-hour{display:none}
+      .logo-counter.operator-wait .logo-counter-total{
+        font-size:16px;
+        line-height:1.25;
+        text-align:center;
+      }
       .${LOGO_WHITE_SQUARE_CLASS} .logo-counter-bot{
         position:absolute;
         left:5px;
@@ -7283,8 +7441,11 @@ function getLogoWhiteSquareElement() {
   }
   box.appendChild(menu);
   registerLogoWhiteSquareCounterRefs({
+    counter,
     icon,
     total,
+    totalRow,
+    hourBlock,
     hourValue,
     arrow,
     ...(menuStructure?.refs || {}),
@@ -7296,6 +7457,7 @@ function getLogoWhiteSquareElement() {
   logoWhiteSquareEl = box;
   logoWhiteSquareMenuEl = menu;
   updateMonitorCounterUI();
+  updateLogoSquareOperatorWaitState();
   return logoWhiteSquareEl;
 }
 
@@ -7392,6 +7554,12 @@ function attachLogoWhiteSquareMenuHandlers() {
       requireExtensionUnlock();
       return;
     }
+    if (isUiBlockedByMissingOperatorId()) {
+      ev.preventDefault();
+      ev.stopPropagation();
+      openOperatorWaitModal();
+      return;
+    }
     const menuClicked =
       logoWhiteSquareMenuEl &&
       (logoWhiteSquareMenuEl === ev.target ||
@@ -7427,6 +7595,7 @@ function toggleLogoWhiteSquareExpandedPanel(forceOpen) {
     requireExtensionUnlock();
     return;
   }
+  if (requireOperatorIdReady({ silent: true })) return;
   const nextOpen =
     typeof forceOpen === "boolean" ? forceOpen : !logoWhiteSquareExpandedOpen;
   if (nextOpen) {
@@ -7518,6 +7687,7 @@ function openLogoWhiteSquareExpandedPanel() {
     requireExtensionUnlock();
     return;
   }
+  if (requireOperatorIdReady({ silent: true })) return;
   const panel = getLogoWhiteSquareExpandedElement();
   const wrapper = getLogoWhiteSquareExpandedWrapper();
   if (!panel) return;
@@ -8158,7 +8328,7 @@ function isAdminUniversalProfileContainerPresent() {
 }
 
 function setOperatorInfoId(operatorId) {
-  operatorInfoState.operatorId = operatorId;
+  operatorInfoState.operatorId = normalizeOperatorId(operatorId);
   operatorInfoState.operatorName = "";
   operatorInfoState.operatorNameUpdatedAt = 0;
   operatorHourlyBalanceMap = new Map();
@@ -8169,6 +8339,7 @@ function setOperatorInfoId(operatorId) {
   try {
     setTimeout(updateOperatorInfoUI, 0);
   } catch {}
+  setOperatorIdAvailability(hasValidOperatorId(), "setOperatorInfoId");
   try {
     fetchOperatorShiftSummary();
   } catch {}
@@ -8563,6 +8734,10 @@ function formatHourTime(date) {
 }
 
 function updateMonitorCounterUI() {
+  if (isUiBlockedByMissingOperatorId()) {
+    updateLogoSquareOperatorWaitState();
+    return;
+  }
   const localChat = monitorCounterState.counts.chat || 0;
   const localMail = monitorCounterState.counts.mail || 0;
   const localTotal = localChat + localMail;
@@ -10439,6 +10614,17 @@ function buildPanel() {
         border-radius:var(--ar-radius, 3px);background:#fff;color:#000;cursor:pointer}
       .auth-modal-btn.primary{background:#1f4f74;border-color:#1f4f74;color:#fff}
       .auth-modal-btn:disabled{opacity:.6;cursor:default}
+      .operator-wait-modal{position:fixed;inset:0;display:none;align-items:center;justify-content:center;
+        background:rgba(14,24,38,0.55);z-index:2147483647;padding:16px;box-sizing:border-box}
+      .operator-wait-modal.open{display:flex}
+      .operator-wait-modal[hidden]{display:none}
+      .operator-wait-modal-dialog{width:min(360px, 100%);display:flex;flex-direction:column;gap:12px;
+        background:#fff;border:1px solid var(--ar-border, ${PANEL_BORDER});border-radius:var(--ar-radius, 3px);
+        box-shadow:0 18px 38px rgba(14,24,38,0.28);padding:14px}
+      .operator-wait-modal-text{font-size:14px;line-height:1.35;color:#0f2d4a;text-align:center}
+      .operator-wait-modal-actions{display:flex;justify-content:flex-end}
+      .operator-wait-modal-btn{padding:7px 14px;font-size:13px;line-height:1.2;border:1px solid #1f4f74;
+        border-radius:var(--ar-radius, 3px);background:#1f4f74;color:#fff;cursor:pointer}
     </style>
     <div class="auth-modal" id="authModal" hidden>
       <div class="auth-modal-dialog" role="dialog" aria-modal="true" aria-labelledby="authModalTitle">
@@ -10449,6 +10635,16 @@ function buildPanel() {
         <div class="auth-modal-actions">
           <button type="button" id="authModalClose" class="auth-modal-btn">Закрыть</button>
           <button type="button" id="authModalSubmit" class="auth-modal-btn primary">Войти</button>
+        </div>
+      </div>
+    </div>
+    <div class="operator-wait-modal" id="operatorWaitModal" hidden>
+      <div class="operator-wait-modal-dialog" role="dialog" aria-modal="true" aria-labelledby="operatorWaitModalText">
+        <div id="operatorWaitModalText" class="operator-wait-modal-text">${escapeHtml(
+          OPERATOR_WAIT_MODAL_MESSAGE
+        )}</div>
+        <div class="operator-wait-modal-actions">
+          <button type="button" id="operatorWaitModalOk" class="operator-wait-modal-btn">ОК</button>
         </div>
       </div>
     </div>
@@ -10580,6 +10776,8 @@ function buildPanel() {
     authModalSubmit: shadow.getElementById("authModalSubmit"),
     authModalClose: shadow.getElementById("authModalClose"),
     authModalError: shadow.getElementById("authModalError"),
+    operatorWaitModal: shadow.getElementById("operatorWaitModal"),
+    operatorWaitModalOk: shadow.getElementById("operatorWaitModalOk"),
     lettersNewWindowToggle: shadow.getElementById("lettersNewWindowToggle"),
     lettersOpenHotkeyInput: shadow.getElementById("lettersOpenHotkeyInput"),
     profilePhotoHotkeyInput: shadow.getElementById("profilePhotoHotkeyInput"),
@@ -10676,6 +10874,18 @@ function buildPanel() {
     ui.authModal.addEventListener("click", (event) => {
       if (event.target === ui.authModal) {
         closeAuthModal();
+      }
+    });
+  }
+  if (ui.operatorWaitModalOk) {
+    ui.operatorWaitModalOk.onclick = () => {
+      closeOperatorWaitModal();
+    };
+  }
+  if (ui.operatorWaitModal) {
+    ui.operatorWaitModal.addEventListener("click", (event) => {
+      if (event.target === ui.operatorWaitModal) {
+        closeOperatorWaitModal();
       }
     });
   }
@@ -11042,6 +11252,10 @@ function buildPanel() {
       }
     };
   ui.launcher.onclick = () => {
+    if (isUiBlockedByMissingOperatorId()) {
+      openOperatorWaitModal();
+      return;
+    }
     togglePanel();
   };
   ui.ta.addEventListener("input", onTextChanged, { passive: true });
@@ -13397,6 +13611,13 @@ function refreshDrawerState(options = {}) {
       updateLauncherVisibility();
       return;
     }
+    if (isUiBlockedByMissingOperatorId()) {
+      ui?.drawer?.classList?.remove("open");
+      ui?.moreBox?.classList?.remove("open");
+      closeUserInfoMenu();
+      updateLauncherVisibility();
+      return;
+    }
     if (wasModalOpen && !force) {
       ui?.drawer?.classList?.remove("open");
       ui?.moreBox?.classList?.remove("open");
@@ -13539,6 +13760,7 @@ window.addEventListener("unload", () => {
   } catch {}
   await loadExtensionLockState();
   buildPanel();
+  setOperatorIdAvailability(hasValidOperatorId(), "init");
   syncMediaBottomIcons();
   ensureConnectManInfoButtons();
   applyModalState(getModalState(), { source: "init" });
@@ -13589,6 +13811,7 @@ window.addEventListener("unload", () => {
     if (
       !isAlphaLanding() &&
       !isExtensionLocked() &&
+      !isUiBlockedByMissingOperatorId() &&
       canRenderDrawerInCurrentContext()
     ) {
       ui.drawer.classList.add("open");
@@ -13630,6 +13853,7 @@ window.addEventListener("unload", () => {
             closeAuthModal();
           } catch {}
         }
+        setOperatorIdAvailability(hasValidOperatorId(), "storage:onChanged");
         try {
           scheduleLogoWhiteSquarePlacement();
         } catch {}
@@ -13699,6 +13923,9 @@ window.addEventListener("unload", () => {
     const msUntilMonitorReset = msUntilNextMonitorBoundary();
     setTimeout(function onMonitorBoundary() {
       resetMonitorCountersForNewDay();
+      try {
+        ui?.balanceMonitor?.clearWsEventsForNewDay?.();
+      } catch {}
       setTimeout(onMonitorBoundary, msUntilNextMonitorBoundary());
     }, msUntilMonitorReset);
   } catch {}
