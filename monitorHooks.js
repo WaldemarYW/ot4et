@@ -17,9 +17,12 @@
       endpoints?.mail || "https://alpha.date/api/mailbox/mail";
     const SENDER_LIST_ENDPOINT =
       endpoints?.senderList || endpoints?.sender_list || "https://alpha.date/api/sender/senderList";
+    const CHAT_HISTORY_ENDPOINT = "https://alpha.date/api/chatList/chatHistory";
     const XHR_SYMBOL = "__ot4etMonitorKind__";
     const XHR_PROFILE_SYMBOL = "__ot4etMonitorProfileId__";
     const XHR_SENDER_LIST_SYMBOL = "__ot4etSenderList__";
+    const XHR_CHAT_HISTORY_SYMBOL = "__ot4etChatHistory__";
+    const XHR_CHAT_HISTORY_META_SYMBOL = "__ot4etChatHistoryMeta__";
     const MAIL_ID_KEYS = [
       "user_id",
       "userid",
@@ -86,6 +89,17 @@
         return url.pathname.startsWith("/api/sender/senderList");
       } catch {}
       return normalized.indexOf("/api/sender/senderList") !== -1;
+    }
+
+    function isChatHistoryInput(input) {
+      const normalized = resolveUrl(input);
+      if (!normalized) return false;
+      if (matchesEndpoint(normalized, CHAT_HISTORY_ENDPOINT)) return true;
+      try {
+        const url = new URL(normalized, window.location.href);
+        return url.pathname.startsWith("/api/chatList/chatHistory");
+      } catch {}
+      return normalized.indexOf("/api/chatList/chatHistory") !== -1;
     }
 
     function hasErrorFlag(data) {
@@ -188,32 +202,49 @@
       return out;
     }
 
-    function extractProfileIdFromBody(kind, body) {
-      if (!body) return "";
-      let data = null;
+    function parseBodyToObject(body) {
+      if (!body) return null;
       if (typeof body === "string") {
         const trimmed = body.trim();
-        if (!trimmed) return "";
+        if (!trimmed) return null;
         try {
-          data = JSON.parse(trimmed);
+          return JSON.parse(trimmed);
         } catch {
-          data = parseQueryString(trimmed);
+          return parseQueryString(trimmed);
         }
-      } else if (
-        typeof FormData !== "undefined" &&
-        body instanceof FormData
-      ) {
-        data = convertFormDataToObject(body);
-      } else if (
-        typeof URLSearchParams !== "undefined" &&
-        body instanceof URLSearchParams
-      ) {
-        data = Object.fromEntries(body.entries());
-      } else if (typeof body === "object") {
-        data = body;
       }
+      if (typeof FormData !== "undefined" && body instanceof FormData) {
+        return convertFormDataToObject(body);
+      }
+      if (typeof URLSearchParams !== "undefined" && body instanceof URLSearchParams) {
+        return Object.fromEntries(body.entries());
+      }
+      if (typeof body === "object") return body;
+      return null;
+    }
+
+    function extractProfileIdFromBody(kind, body) {
+      if (!body) return "";
+      const data = parseBodyToObject(body);
       if (!data) return "";
       return extractProfileIdFromData(data, kind);
+    }
+
+    function extractChatHistoryRequestMeta(body) {
+      const parsed = parseBodyToObject(body);
+      if (!parsed || typeof parsed !== "object") {
+        return { chat_id: "", chat_uid: "", page: 1 };
+      }
+      const rawChatId =
+        parsed.chat_id ?? parsed.chatId ?? parsed.id ?? parsed.chatID ?? "";
+      const rawChatUid = parsed.chat_uid ?? parsed.chatUid ?? parsed.uid ?? "";
+      const rawPage = parsed.page ?? parsed.currentPage ?? parsed.pageNumber;
+      const pageNum = Number(rawPage);
+      return {
+        chat_id: String(rawChatId ?? "").trim(),
+        chat_uid: String(rawChatUid ?? "").trim(),
+        page: Number.isFinite(pageNum) && pageNum > 0 ? Math.floor(pageNum) : 1,
+      };
     }
 
     function extractProfileIdFromFetchArgs(kind, args) {
@@ -248,6 +279,67 @@
         );
       } catch {}
       window.postMessage({ type: "OT4ET_SENDER_LIST", payload }, "*");
+    }
+
+    function postChatHistoryStats(payload) {
+      try {
+        if (!payload || typeof payload !== "object") return;
+        window.postMessage({ type: "OT4ET_CHAT_HISTORY_STATS", payload }, "*");
+      } catch {}
+    }
+
+    function parseChatHistoryStats(payload, requestMeta) {
+      let data = payload;
+      if (typeof payload === "string") {
+        const text = payload.trim();
+        if (!text) return null;
+        try {
+          data = JSON.parse(text);
+        } catch {
+          return null;
+        }
+      }
+      if (!data || typeof data !== "object") return null;
+      if (data.status !== true) return null;
+      const list = Array.isArray(data.response) ? data.response : [];
+      let maxSpend = 0;
+      let hasMaleRow = false;
+      let chatUid = String(requestMeta?.chat_uid || "").trim();
+      let chatId = String(requestMeta?.chat_id || "").trim();
+      let manExternalId = "";
+      let womanExternalId = "";
+      for (const row of list) {
+        if (!row || typeof row !== "object") continue;
+        if (!chatUid && row.chat_uid != null) chatUid = String(row.chat_uid).trim();
+        if (!chatId && row.chat_id != null) chatId = String(row.chat_id).trim();
+        const spend = Number(row.spend_all_credits);
+        const hasSpend = Number.isFinite(spend) && spend >= 0;
+        const maleFlag = Number(row.is_male);
+        const isMaleMessage =
+          maleFlag === 1 ||
+          ((row.is_male == null || row.is_male === "") &&
+            hasSpend &&
+            !!String(row.sender_external_id || "").trim());
+        if (!isMaleMessage || !hasSpend) continue;
+        if (!manExternalId && row.sender_external_id != null) {
+          manExternalId = String(row.sender_external_id).replace(/\D/g, "");
+        }
+        if (!womanExternalId && row.recipient_external_id != null) {
+          womanExternalId = String(row.recipient_external_id).replace(/\D/g, "");
+        }
+        hasMaleRow = true;
+        if (spend > maxSpend) maxSpend = spend;
+      }
+      if (!chatUid && !chatId) return null;
+      return {
+        chat_uid: chatUid,
+        chat_id: chatId,
+        max_spend_all_credits: hasMaleRow ? maxSpend : 0,
+        man_external_id: manExternalId,
+        woman_external_id: womanExternalId,
+        page: Number(requestMeta?.page) || 1,
+        updated_at: Date.now(),
+      };
     }
 
     function postWsEvent(payload) {
@@ -404,6 +496,9 @@
         "recipient_external_id",
         "recipientExternalId",
       ]);
+      const messagePrice =
+        extractFirstValue(source, ["message_price", "messagePrice"]) ??
+        extractFirstValue(payload, ["message_price", "messagePrice"]);
       if (!messageType || !createdAt || !chatUid) return;
       if (!shouldEmitWsEvent(source, channelText)) return;
       postWsEvent({
@@ -412,6 +507,7 @@
         chat_uid: chatUid,
         sender_external_id: senderExternalId ?? null,
         recipient_external_id: recipientExternalId ?? null,
+        message_price: messagePrice ?? null,
       });
     }
 
@@ -526,16 +622,25 @@
       window.fetch = function patchedFetch(...args) {
         let kind = "";
         let senderList = false;
+        let chatHistory = false;
+        let chatHistoryMeta = null;
         try {
           kind = getKindFromInput(args[0]);
           senderList = isSenderListInput(args[0]);
+          chatHistory = isChatHistoryInput(args[0]);
+          if (chatHistory) {
+            const init = args[1];
+            chatHistoryMeta = extractChatHistoryRequestMeta(init?.body);
+          }
         } catch {
           kind = "";
           senderList = false;
+          chatHistory = false;
+          chatHistoryMeta = null;
         }
         const profileHint = extractProfileIdFromFetchArgs(kind, args);
         const result = originalFetch.apply(this, args);
-        if ((!kind && !senderList) || !result || typeof result.then !== "function") {
+        if ((!kind && !senderList && !chatHistory) || !result || typeof result.then !== "function") {
           return result;
         }
         return result.then((response) => {
@@ -547,6 +652,13 @@
                 .then((text) => {
                   if (kind) evaluatePayload(text, kind, profileHint);
                   if (senderList && text) notifySenderList(text);
+                  if (chatHistory && text) {
+                    const page = Number(chatHistoryMeta?.page) || 1;
+                    if (page === 1) {
+                      const stats = parseChatHistoryStats(text, chatHistoryMeta || {});
+                      if (stats) postChatHistoryStats(stats);
+                    }
+                  }
                 })
                 .catch(() => {});
             }
@@ -568,15 +680,18 @@
         try {
           this[XHR_SYMBOL] = getKindFromInput(url);
           this[XHR_SENDER_LIST_SYMBOL] = isSenderListInput(url);
+          this[XHR_CHAT_HISTORY_SYMBOL] = isChatHistoryInput(url);
         } catch {
           this[XHR_SYMBOL] = "";
           this[XHR_SENDER_LIST_SYMBOL] = false;
+          this[XHR_CHAT_HISTORY_SYMBOL] = false;
         }
         return originalOpen.call(this, method, url, ...rest);
       };
       proto.send = function patchedSend(...args) {
         const kind = this[XHR_SYMBOL];
         const senderList = this[XHR_SENDER_LIST_SYMBOL];
+        const chatHistory = this[XHR_CHAT_HISTORY_SYMBOL];
         if (kind) {
           const body = args[0];
           try {
@@ -587,17 +702,30 @@
         } else {
           this[XHR_PROFILE_SYMBOL] = "";
         }
-        if (kind || senderList) {
+        if (chatHistory) {
+          try {
+            this[XHR_CHAT_HISTORY_META_SYMBOL] = extractChatHistoryRequestMeta(args[0]);
+          } catch {
+            this[XHR_CHAT_HISTORY_META_SYMBOL] = null;
+          }
+        } else {
+          this[XHR_CHAT_HISTORY_META_SYMBOL] = null;
+        }
+        if (kind || senderList || chatHistory) {
           this.addEventListener(
             "loadend",
             () => {
               const currentKind = this[XHR_SYMBOL];
               const profileHint = this[XHR_PROFILE_SYMBOL];
               const isSenderList = this[XHR_SENDER_LIST_SYMBOL];
+              const isChatHistory = this[XHR_CHAT_HISTORY_SYMBOL];
+              const chatHistoryMeta = this[XHR_CHAT_HISTORY_META_SYMBOL];
               this[XHR_SYMBOL] = "";
               this[XHR_PROFILE_SYMBOL] = "";
               this[XHR_SENDER_LIST_SYMBOL] = false;
-              if (!currentKind && !isSenderList) return;
+              this[XHR_CHAT_HISTORY_SYMBOL] = false;
+              this[XHR_CHAT_HISTORY_META_SYMBOL] = null;
+              if (!currentKind && !isSenderList && !isChatHistory) return;
               try {
                 if (this.status >= 200 && this.status < 300) {
                   let payload = null;
@@ -616,6 +744,13 @@
                     }
                     if (isSenderList) {
                       notifySenderList(payload);
+                    }
+                    if (isChatHistory) {
+                      const page = Number(chatHistoryMeta?.page) || 1;
+                      if (page === 1) {
+                        const stats = parseChatHistoryStats(payload, chatHistoryMeta || {});
+                        if (stats) postChatHistoryStats(stats);
+                      }
                     }
                   }
                 }

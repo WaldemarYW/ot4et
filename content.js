@@ -154,6 +154,22 @@ const LANG = {
     chartFilterChat: "Чаты",
     chartFilterActive: "Актив",
     chartLegendPaid: "Платных действий",
+    ratingTitleBalance: "Балансы",
+    ratingTitleActions: "Действия",
+    ratingMainShiftBalance: "Баланс за смену",
+    ratingMainShiftActions: "Действия за смену",
+    ratingTabShift: "За смену",
+    ratingTabAllTime: "За всё время",
+    ratingColRank: "#",
+    ratingColName: "Имя",
+    ratingColValue: "Баланс",
+    ratingColChat: "Чаты",
+    ratingColMail: "Письма",
+    ratingColTotal: "Всего",
+    ratingLoading: "Загрузка рейтинга...",
+    ratingEmpty: "Нет данных",
+    ratingError: "Не удалось загрузить рейтинг",
+    ratingUpdatedAt: "Обновлено",
     foundCount: (n) => `Найдено отчётов: ${n}`,
     confirmDownloadYesterday: "Вы скачиваете отчёт за вчера. Продолжить?",
     newFolderPlaceholder: "Название новой папки",
@@ -221,6 +237,22 @@ const LANG = {
     chartFilterChat: "Чати",
     chartFilterActive: "Актив",
     chartLegendPaid: "Платних дій",
+    ratingTitleBalance: "Баланси",
+    ratingTitleActions: "Дії",
+    ratingMainShiftBalance: "Баланс за зміну",
+    ratingMainShiftActions: "Дії за зміну",
+    ratingTabShift: "За зміну",
+    ratingTabAllTime: "За весь час",
+    ratingColRank: "#",
+    ratingColName: "Ім'я",
+    ratingColValue: "Баланс",
+    ratingColChat: "Чати",
+    ratingColMail: "Листи",
+    ratingColTotal: "Всього",
+    ratingLoading: "Завантаження рейтингу...",
+    ratingEmpty: "Немає даних",
+    ratingError: "Не вдалося завантажити рейтинг",
+    ratingUpdatedAt: "Оновлено",
     foundCount: (n) => `Знайдено звітів: ${n}`,
     confirmDownloadYesterday: "Ви завантажуєте звіт за вчора. Продовжити?",
     newFolderPlaceholder: "Назва нової папки",
@@ -256,6 +288,11 @@ const S = {
 };
 const WOMAN_TIME_CLASS = "ot4et-woman-localtime";
 const MAN_TIME_CLASS = "ot4et-man-localtime";
+const MAN_SPEND_CLASS = "ot4et-man-spend-balance";
+const MAN_ID_BALANCE_WRAP_CLASS = "ot4et-man-id-balance-wrap";
+const MAN_PROFILE_ID_SELECTOR_PRIMARY =
+  '[class*="styles_clmn_3_chat_head_profile_id__"]';
+const MAN_PROFILE_ID_SELECTOR_FALLBACK = '[class*="chat_head_profile_id__"]';
 const LOCAL_TIME_STYLE_ID = "ot4et-localtime-style";
 const PROFILE_INFO_BUTTON_CLASS = "ot4et-profile-info-button";
 const PROFILE_INFO_BLOCK_CLASS = "ot4et-profile-info-block";
@@ -310,6 +347,11 @@ const MONITOR_ENDPOINTS = Object.freeze({
 });
 const CONFIG_TYPE_CHECK_ENDPOINT = "https://alpha.date/api/config/type/check";
 const CONFIG_TYPE_CACHE_TTL_MS = 60 * 1000;
+const CHAT_HISTORY_ENDPOINT = "https://alpha.date/api/chatList/chatHistory";
+const WS_CHAT_HISTORY_SPEND_CACHE_TTL_MS = 60 * 1000;
+const OPERATOR_RATING_ENDPOINT = "/operators/rating";
+const OPERATOR_RATING_LIMIT = 50;
+const OPERATOR_RATING_CACHE_TTL_MS = 5 * 60 * 1000;
 
 function notifyMonitorRecord(kind, profileId, count) {
   try {
@@ -330,9 +372,29 @@ function notifyMonitorRecord(kind, profileId, count) {
 let monitorBridgeInitialized = false;
 let senderListBridgeInitialized = false;
 let wsEventBridgeInitialized = false;
+let chatHistorySpendBridgeInitialized = false;
 let wsEventQueue = [];
+let chatHistorySpendQueue = [];
+let wsEventsDisabled = (() => {
+  try {
+    const raw = String(window?.localStorage?.getItem?.("ot4et_ws_events_disabled") || "")
+      .trim()
+      .toLowerCase();
+    return raw === "1" || raw === "true";
+  } catch {
+    return false;
+  }
+})();
 const wsConfigTypeCache = new Map();
 const wsConfigTypeInFlight = new Map();
+const wsChatHistorySpendCache = new Map();
+const wsChatHistorySpendInFlight = new Map();
+const manSpendByChatUid = new Map();
+const manSpendByChatId = new Map();
+const manSpendByPairKey = new Map();
+const headerChatHistorySpendInFlight = new Map();
+const HEADER_CHAT_HISTORY_SPEND_REFRESH_TTL_MS = 60 * 1000;
+let activeChatUidCache = "";
 
 function handleMonitorBridgeMessage(event) {
   try {
@@ -395,6 +457,89 @@ function normalizeExternalId(value) {
   const raw = String(value ?? "").trim();
   if (!raw) return "";
   return raw.replace(/\D/g, "");
+}
+
+function getManSpendPairKey(manExternalId, womanExternalId) {
+  const man = normalizeExternalId(manExternalId);
+  const woman = normalizeExternalId(womanExternalId);
+  if (!man || !woman) return "";
+  return `${man}::${woman}`;
+}
+
+function upsertManSpendEntry(entry) {
+  if (!entry || typeof entry !== "object") return;
+  const updatedAt = Number(entry.updated_at || 0) || Date.now();
+  const chatUid = String(entry.chat_uid || "").trim();
+  const chatId = String(entry.chat_id || "").trim();
+  const maxSpendRaw = Number(entry.max_spend_all_credits);
+  const maxSpend = Number.isFinite(maxSpendRaw) && maxSpendRaw >= 0 ? maxSpendRaw : 0;
+  const manExternalId = normalizeExternalId(entry.man_external_id);
+  const womanExternalId = normalizeExternalId(entry.woman_external_id);
+  const normalized = {
+    chat_uid: chatUid,
+    chat_id: chatId,
+    max_spend_all_credits: maxSpend,
+    man_external_id: manExternalId,
+    woman_external_id: womanExternalId,
+    updated_at: updatedAt,
+  };
+  if (chatUid) {
+    const prev = manSpendByChatUid.get(chatUid);
+    if (!prev || Number(prev.updated_at || 0) <= updatedAt) {
+      manSpendByChatUid.set(chatUid, normalized);
+      activeChatUidCache = chatUid;
+    }
+  }
+  if (chatId) {
+    const prev = manSpendByChatId.get(chatId);
+    if (!prev || Number(prev.updated_at || 0) <= updatedAt) {
+      manSpendByChatId.set(chatId, normalized);
+    }
+  }
+  const pairKey = getManSpendPairKey(manExternalId, womanExternalId);
+  if (pairKey) {
+    const prev = manSpendByPairKey.get(pairKey);
+    if (!prev || Number(prev.updated_at || 0) <= updatedAt) {
+      manSpendByPairKey.set(pairKey, normalized);
+    }
+  }
+}
+
+function handleChatHistorySpendBridgeMessage(event) {
+  try {
+    if (!event || event.source !== window) return;
+    const data = event.data;
+    if (!data || data.type !== "OT4ET_CHAT_HISTORY_STATS") return;
+    const payload = data.payload;
+    if (!payload || typeof payload !== "object") return;
+    upsertManSpendEntry(payload);
+    if (ui?.drawer || ui?.head || ui?.launcher) {
+      updateManSpendInHeader();
+      return;
+    }
+    chatHistorySpendQueue.push(payload);
+    if (chatHistorySpendQueue.length > 200) {
+      chatHistorySpendQueue = chatHistorySpendQueue.slice(-200);
+    }
+  } catch {}
+}
+
+function consumeQueuedChatHistorySpendEvents() {
+  try {
+    if (!chatHistorySpendQueue.length) return;
+    const queued = chatHistorySpendQueue.slice();
+    chatHistorySpendQueue = [];
+    queued.forEach((item) => upsertManSpendEntry(item));
+    updateManSpendInHeader();
+  } catch {}
+}
+
+function setupChatHistorySpendMessageBridge() {
+  if (chatHistorySpendBridgeInitialized) return;
+  chatHistorySpendBridgeInitialized = true;
+  try {
+    window.addEventListener("message", handleChatHistorySpendBridgeMessage);
+  } catch {}
 }
 
 function getConfigTypeCacheKey(manExternalID, womanExternalID) {
@@ -502,6 +647,119 @@ async function resolveEventConfigType(eventItem) {
   }
 }
 
+function normalizeWsChatUid(value) {
+  return String(value || "").trim();
+}
+
+function normalizeWsMessagePrice(value) {
+  const num = Number(value);
+  if (!Number.isFinite(num) || num <= 0) return null;
+  return {
+    raw: num,
+    rounded: Math.round(num),
+  };
+}
+
+async function fetchWsChatHistoryPageOne({ token, chatUid }) {
+  const normalizedToken = String(token || "").trim();
+  const normalizedChatUid = normalizeWsChatUid(chatUid);
+  if (!normalizedToken || !normalizedChatUid) return null;
+  try {
+    const response = await fetch(CHAT_HISTORY_ENDPOINT, {
+      method: "POST",
+      credentials: "include",
+      headers: {
+        accept: "application/json, text/plain, */*",
+        "content-type": "application/json",
+        authorization: `Bearer ${normalizedToken}`,
+      },
+      body: JSON.stringify({
+        chat_id: normalizedChatUid,
+        page: 1,
+      }),
+    });
+    if (!response.ok) return null;
+    return await response.json().catch(() => null);
+  } catch {
+    return null;
+  }
+}
+
+function extractMaxSpendAllCreditsFromChatHistory(payload) {
+  if (!payload || typeof payload !== "object") return 0;
+  const list = Array.isArray(payload?.response) ? payload.response : [];
+  if (!list.length) return 0;
+  let maxSpend = 0;
+  for (const row of list) {
+    const spend = Number(row?.spend_all_credits);
+    if (!Number.isFinite(spend) || spend < 0) continue;
+    if (spend > maxSpend) maxSpend = spend;
+  }
+  return maxSpend;
+}
+
+async function resolveWsEventHasSpendByChatUid(chatUid) {
+  const normalizedChatUid = normalizeWsChatUid(chatUid);
+  if (!normalizedChatUid) return null;
+  const now = Date.now();
+  const cached = wsChatHistorySpendCache.get(normalizedChatUid);
+  if (cached && Number(cached.expiresAt) > now) {
+    return {
+      hasSpend: !!cached.hasSpend,
+      maxSpend: Number.isFinite(Number(cached.maxSpend)) ? Number(cached.maxSpend) : 0,
+    };
+  }
+  const inFlight = wsChatHistorySpendInFlight.get(normalizedChatUid);
+  if (inFlight) return inFlight.catch(() => null);
+  const requestPromise = (async () => {
+    const token = await getAuthTokenForConfigCheck();
+    if (!token) return null;
+    const payload = await fetchWsChatHistoryPageOne({
+      token,
+      chatUid: normalizedChatUid,
+    });
+    const maxSpend = extractMaxSpendAllCreditsFromChatHistory(payload);
+    const result = {
+      hasSpend: maxSpend > 0,
+      maxSpend,
+    };
+    wsChatHistorySpendCache.set(normalizedChatUid, {
+      ...result,
+      expiresAt: Date.now() + WS_CHAT_HISTORY_SPEND_CACHE_TTL_MS,
+    });
+    return result;
+  })();
+  wsChatHistorySpendInFlight.set(normalizedChatUid, requestPromise);
+  try {
+    return await requestPromise;
+  } catch {
+    return null;
+  } finally {
+    wsChatHistorySpendInFlight.delete(normalizedChatUid);
+  }
+}
+
+async function enrichWsEventWithChatSpend(item) {
+  if (!item || typeof item !== "object") return item;
+  const normalized = {
+    ...item,
+    chatHasSpend: !!item.chatHasSpend,
+    chatMaxSpendAllCredits: Number(item.chatMaxSpendAllCredits) || 0,
+    chatSpendChecked: !!item.chatSpendChecked,
+  };
+  const chatUid = normalizeWsChatUid(item.chat_uid);
+  if (!chatUid) {
+    normalized.chatSpendChecked = true;
+    return normalized;
+  }
+  const spendInfo = await resolveWsEventHasSpendByChatUid(chatUid);
+  if (!spendInfo) return normalized;
+  normalized.chatHasSpend = !!spendInfo.hasSpend;
+  normalized.chatMaxSpendAllCredits = Number(spendInfo.maxSpend) || 0;
+  normalized.chatSpendChecked = true;
+  return normalized;
+}
+
 function getEventRowClassByType(type) {
   const normalized = Number(type);
   if (normalized === 1) return "adb-row-type-1";
@@ -549,6 +807,7 @@ async function resolveMailChatUidFromSocket(payload) {
 
 function handleWsEventBridgeMessage(event) {
   try {
+    if (wsEventsDisabled) return;
     if (!event || event.source !== window) return;
     const data = event.data;
     if (!data || data.type !== "OT4ET_WS_EVENT") return;
@@ -577,7 +836,8 @@ function handleWsEventBridgeMessage(event) {
             manExternalID: normalizeExternalId(payload.male_external_id),
             womanExternalID: normalizeExternalId(payload.female_id),
           };
-          const item = await enrichWsEventWithConfigType(itemBase);
+          const withConfigType = await enrichWsEventWithConfigType(itemBase);
+          const item = await enrichWsEventWithChatSpend(withConfigType);
           const monitor = ui?.balanceMonitor;
           if (monitor && typeof monitor.addWsEvent === "function") {
             monitor.addWsEvent(item);
@@ -598,8 +858,10 @@ function handleWsEventBridgeMessage(event) {
         normalizeExternalId(payload.womanExternalID) ||
         normalizeExternalId(payload.recipient_external_id) ||
         normalizeExternalId(payload.recipientExternalId),
+      message_price: payload.message_price ?? payload.messagePrice ?? null,
     };
     enrichWsEventWithConfigType(baseItem)
+      .then((withConfigType) => enrichWsEventWithChatSpend(withConfigType))
       .then((item) => {
         const monitor = ui?.balanceMonitor;
         if (monitor && typeof monitor.addWsEvent === "function") {
@@ -689,6 +951,7 @@ injectMonitorNetworkHooks();
 setupMonitorMessageBridge();
 setupSenderListMessageBridge();
 setupWsEventMessageBridge();
+setupChatHistorySpendMessageBridge();
 hydrateSenderListFromStorage();
 
 
@@ -752,6 +1015,9 @@ function createBalanceMonitorWidget() {
   let lastBalanceDate = "";
   let wsEvents = [];
   let wsEventsDayKey = "";
+  let wsSpendHydrationScheduled = false;
+  let webhooksPaidFilterEnabled = false;
+  let wsEventsFeatureDisabled = false;
 
   const widget = document.createElement("div");
   widget.id = "adb-panel";
@@ -814,6 +1080,7 @@ function createBalanceMonitorWidget() {
     tabWebhooks: widget.querySelector("#adb-tab-webhooks"),
     panelBalance: widget.querySelector("#adb-panel-balance"),
     panelWebhooks: widget.querySelector("#adb-panel-webhooks"),
+    tools: widget.querySelector(".adb-tools"),
   };
 
   let detailsOpen = false;
@@ -829,6 +1096,89 @@ function createBalanceMonitorWidget() {
   let wsFreshTimerId = null;
   let renderedKeysAtMaxTs = new Set();
   let seenKeysAtLatestTs = new Set();
+
+  function loadWebhooksFilterState() {
+    try {
+      const raw = String(window?.localStorage?.getItem?.(WS_WEBHOOK_FILTER_STORAGE_KEY) || "")
+        .trim()
+        .toLowerCase();
+      webhooksPaidFilterEnabled = raw === "1" || raw === "true";
+    } catch {
+      webhooksPaidFilterEnabled = false;
+    }
+  }
+
+  function persistWebhooksFilterState() {
+    try {
+      window?.localStorage?.setItem?.(
+        WS_WEBHOOK_FILTER_STORAGE_KEY,
+        webhooksPaidFilterEnabled ? "1" : "0"
+      );
+    } catch {}
+  }
+
+  function setWebhooksPaidFilterEnabled(next, options = {}) {
+    const { persist = true, render = true } = options || {};
+    webhooksPaidFilterEnabled = !!next;
+    if (persist) {
+      persistWebhooksFilterState();
+    }
+    if (render) {
+      renderWsEvents();
+    }
+  }
+
+  function applyWsEventsFeatureState() {
+    try {
+      if (elements.tabWebhooks) {
+        elements.tabWebhooks.hidden = wsEventsFeatureDisabled;
+      }
+      if (elements.panelWebhooks) {
+        elements.panelWebhooks.hidden =
+          wsEventsFeatureDisabled || activeTab !== "webhooks";
+      }
+      if (elements.tabBalance) {
+        elements.tabBalance.style.flex = "1 1 0";
+      }
+    } catch {}
+  }
+
+  function setWsEventsFeatureDisabled(next, options = {}) {
+    const { persist = true, clearList = true } = options || {};
+    wsEventsFeatureDisabled = !!next;
+    if (persist) {
+      try {
+        window?.localStorage?.setItem?.(
+          WS_EVENTS_DISABLED_STORAGE_KEY,
+          wsEventsFeatureDisabled ? "1" : "0"
+        );
+      } catch {}
+    }
+    if (wsEventsFeatureDisabled) {
+      wsEventsFresh = false;
+      applyWsFreshState();
+      if (clearList) {
+        ensureWsEventsDayKey();
+        wsEvents = [];
+        renderWsEvents();
+        persistWsEventsCache();
+      }
+      if (activeTab === "webhooks") {
+        switchTab("balance");
+      }
+    } else {
+      renderWsEvents();
+    }
+    applyWsEventsFeatureState();
+  }
+
+  function isWebhookRowPaidCandidate(item) {
+    if (!item || typeof item !== "object") return false;
+    const hasSpendIcon = !!item.chatHasSpend;
+    const roundedPrice = Number(item.messagePriceRounded);
+    const hasPrice = Number.isFinite(roundedPrice) && roundedPrice > 0;
+    return hasSpendIcon || hasPrice;
+  }
 
   function syncLogoWhiteSquareBalanceFromWidget() {
     try {
@@ -969,7 +1319,9 @@ function createBalanceMonitorWidget() {
   }
 
   function switchTab(tabKey) {
-    const next = tabKey === "webhooks" ? "webhooks" : "balance";
+    const requested = tabKey === "webhooks" ? "webhooks" : "balance";
+    const next =
+      wsEventsFeatureDisabled && requested === "webhooks" ? "balance" : requested;
     activeTab = next;
     const balanceActive = next === "balance";
     if (elements.tabBalance) {
@@ -984,12 +1336,13 @@ function createBalanceMonitorWidget() {
       elements.panelBalance.hidden = !balanceActive;
     }
     if (elements.panelWebhooks) {
-      elements.panelWebhooks.hidden = balanceActive;
+      elements.panelWebhooks.hidden = balanceActive || wsEventsFeatureDisabled;
     }
     if (!balanceActive && detailsOpen) {
       markWsEventsSeen();
     }
     applyListHeight();
+    applyWsEventsFeatureState();
   }
 
   function setDetailsOpen(open) {
@@ -1051,6 +1404,7 @@ function createBalanceMonitorWidget() {
   elements.toggle?.addEventListener("click", () => {
     setDetailsOpen(!detailsOpen);
   });
+  loadWebhooksFilterState();
   elements.tabBalance?.addEventListener("click", () => switchTab("balance"));
   elements.tabWebhooks?.addEventListener("click", () => switchTab("webhooks"));
 
@@ -1226,12 +1580,21 @@ function createBalanceMonitorWidget() {
 
   function renderWsEvents() {
     if (!elements.webhooksList) return;
-    if (!wsEvents.length) {
-      elements.webhooksList.innerHTML =
-        '<div class="adb-empty">Нет webhook-событий</div>';
+    if (wsEventsFeatureDisabled) {
+      elements.webhooksList.innerHTML = "";
       return;
     }
-    const rows = wsEvents
+    const sourceEvents = webhooksPaidFilterEnabled
+      ? wsEvents.filter((item) => isWebhookRowPaidCandidate(item))
+      : wsEvents;
+    if (!sourceEvents.length) {
+      elements.webhooksList.innerHTML =
+        webhooksPaidFilterEnabled
+          ? '<div class="adb-empty">Нет событий с иконкой или ценой</div>'
+          : '<div class="adb-empty">Нет webhook-событий</div>';
+      return;
+    }
+    const rows = sourceEvents
       .map((item) => {
         const messageType = String(item?.message_type || "").trim();
         const createdAt = item?.created_at || "";
@@ -1243,13 +1606,23 @@ function createBalanceMonitorWidget() {
         const link = buildWsLink(messageType, chatUid);
         const safeHref = escapeHtml(link);
         const typeClass = getEventRowClassByType(item?.configType);
+        const spendTitle = "Платник";
+        const spendIcon = item?.chatHasSpend
+          ? `<span class="adb-spend-flag" title="${escapeHtml(spendTitle)}"></span>`
+          : "";
+        const roundedPrice = Number(item?.messagePriceRounded);
+        const priceBadge = Number.isFinite(roundedPrice) && roundedPrice > 0
+          ? `<span class="adb-price-badge" title="Цена сообщения">${escapeHtml(
+              String(Math.round(roundedPrice))
+            )}</span>`
+          : "";
         const rowClass = [item?.seen ? "adb-row" : "adb-row new", typeClass]
           .filter(Boolean)
           .join(" ");
         return `
           <a class="${rowClass}" href="${safeHref}" target="_blank" rel="noopener" title="${safeType}">
             <span class="adb-time">${safeTime}</span>
-            <span class="adb-label"><span class="adb-label-inner">${safeType}</span></span>
+            <span class="adb-label"><span class="adb-label-inner">${safeType}</span></span>${priceBadge}${spendIcon}
           </a>
         `.trim();
       })
@@ -1257,6 +1630,53 @@ function createBalanceMonitorWidget() {
       .join("");
     elements.webhooksList.innerHTML = rows || '<div class="adb-empty">Нет webhook-событий</div>';
     updateLabelScrolling();
+    scheduleWsSpendHydration();
+  }
+
+  function scheduleWsSpendHydration() {
+    if (wsSpendHydrationScheduled) return;
+    wsSpendHydrationScheduled = true;
+    setTimeout(async () => {
+      wsSpendHydrationScheduled = false;
+      try {
+        if (!Array.isArray(wsEvents) || !wsEvents.length) return;
+        let changed = false;
+        let unresolvedLeft = false;
+        const maxToProcess = 20;
+        let processed = 0;
+        for (let i = 0; i < wsEvents.length; i += 1) {
+          const item = wsEvents[i];
+          if (!item || item.chatSpendChecked) continue;
+          unresolvedLeft = true;
+          if (processed >= maxToProcess) continue;
+          processed += 1;
+          const chatUid = normalizeWsChatUid(item.chat_uid);
+          if (!chatUid) {
+            wsEvents[i] = { ...item, chatSpendChecked: true };
+            changed = true;
+            continue;
+          }
+          const spendInfo = await resolveWsEventHasSpendByChatUid(chatUid);
+          if (!spendInfo) continue;
+          wsEvents[i] = {
+            ...item,
+            chatHasSpend: !!spendInfo.hasSpend,
+            chatMaxSpendAllCredits: Number(spendInfo.maxSpend) || 0,
+            chatSpendChecked: true,
+          };
+          changed = true;
+        }
+        if (changed) {
+          renderWsEvents();
+          persistWsEventsCache();
+        } else if (unresolvedLeft) {
+          // Retry later for temporary auth/network misses.
+          setTimeout(() => {
+            scheduleWsSpendHydration();
+          }, 1500);
+        }
+      } catch {}
+    }, 0);
   }
 
   function persistWsEventsCache() {
@@ -1293,6 +1713,12 @@ function createBalanceMonitorWidget() {
 
   async function loadWsEventsCache() {
     try {
+      if (wsEventsFeatureDisabled) {
+        wsEventsDayKey = getKyivDayKey();
+        wsEvents = [];
+        renderWsEvents();
+        return;
+      }
       const store = await getStore([WS_EVENTS_STORAGE_KEY]);
       let cached = store[WS_EVENTS_STORAGE_KEY];
       if (!cached || typeof cached !== "object") {
@@ -1576,6 +2002,7 @@ function createBalanceMonitorWidget() {
   }
   setDetailsOpen(false);
   switchTab("webhooks");
+  setWsEventsFeatureDisabled(wsEventsDisabled, { persist: false, clearList: wsEventsDisabled });
   applyBalanceFreshState();
   applyWsFreshState();
   syncLogoWhiteSquareBalanceFromWidget();
@@ -1598,9 +2025,15 @@ function createBalanceMonitorWidget() {
     setMaxContainerHeight,
     closeDetails: () => setDetailsOpen(false),
     switchTab,
+    getWebhooksPaidFilterEnabled: () => webhooksPaidFilterEnabled,
+    setWebhooksPaidFilterEnabled,
+    refreshWsEventsFilter: () => renderWsEvents(),
+    getWsEventsFeatureDisabled: () => wsEventsFeatureDisabled,
+    setWsEventsFeatureDisabled,
     clearWsEventsForNewDay,
     addWsEvent(eventPayload) {
       try {
+        if (wsEventsFeatureDisabled) return;
         if (!eventPayload || typeof eventPayload !== "object") return;
         const messageType = String(eventPayload.message_type || "").trim();
         const createdAt = eventPayload.created_at || "";
@@ -1613,6 +2046,7 @@ function createBalanceMonitorWidget() {
           configTypeRaw === 1 || configTypeRaw === 2 || configTypeRaw === 3
             ? configTypeRaw
             : null;
+        const priceInfo = normalizeWsMessagePrice(eventPayload.message_price);
         ensureWsEventsDayKey();
         wsEvents.unshift({
           message_type: messageType,
@@ -1621,6 +2055,14 @@ function createBalanceMonitorWidget() {
           manExternalID,
           womanExternalID,
           configType,
+          chatHasSpend: !!eventPayload.chatHasSpend,
+          chatMaxSpendAllCredits: Number(eventPayload.chatMaxSpendAllCredits) || 0,
+          chatSpendChecked:
+            typeof eventPayload.chatSpendChecked === "boolean"
+              ? eventPayload.chatSpendChecked
+              : !!eventPayload.chatHasSpend,
+          messagePriceRaw: priceInfo?.raw ?? null,
+          messagePriceRounded: priceInfo?.rounded ?? null,
           seen: false,
         });
         if (wsEvents.length > 200) {
@@ -1693,6 +2135,8 @@ const LETTERS_OPEN_HOTKEY_STORAGE_KEY = "lettersOpenHotkey";
 const LETTERS_OPEN_HOTKEY_DEFAULT = "ctrl+l";
 const PROFILE_PHOTO_HOTKEY_STORAGE_KEY = "profilePhotoHotkey";
 const PROFILE_PHOTO_HOTKEY_DEFAULT = "ctrl+p";
+const TRANSLATE_SEND_HOTKEY_STORAGE_KEY = "translateSendHotkey";
+const TRANSLATE_SEND_HOTKEY_DEFAULT = "ctrl+g";
 const OPERATOR_WAIT_SQUARE_MESSAGE = "Включите сендер";
 const OPERATOR_WAIT_MODAL_MESSAGE =
   "Для начала работы с расширением OT4ET включите сендер";
@@ -1825,6 +2269,94 @@ function setLettersNewWindowEnabled(next, options = {}) {
   }
 }
 
+function getWebhooksPaidEventsFilterEnabled() {
+  try {
+    if (ui?.balanceMonitor && typeof ui.balanceMonitor.getWebhooksPaidFilterEnabled === "function") {
+      return !!ui.balanceMonitor.getWebhooksPaidFilterEnabled();
+    }
+  } catch {}
+  try {
+    const raw = String(window?.localStorage?.getItem?.(WS_WEBHOOK_FILTER_STORAGE_KEY) || "")
+      .trim()
+      .toLowerCase();
+    return raw === "1" || raw === "true";
+  } catch {
+    return false;
+  }
+}
+
+function setWebhooksPaidFilterControlDisabled(disabled) {
+  const next = !!disabled;
+  try {
+    if (ui?.webhooksPaidFilterToggle) {
+      ui.webhooksPaidFilterToggle.disabled = next;
+      const row = ui.webhooksPaidFilterToggle.closest?.(".settings-row");
+      if (row) row.classList.toggle("is-disabled", next);
+    }
+  } catch {}
+}
+
+function getWsEventsDisabledSetting() {
+  try {
+    const raw = String(
+      window?.localStorage?.getItem?.(WS_EVENTS_DISABLED_STORAGE_KEY) || ""
+    )
+      .trim()
+      .toLowerCase();
+    if (!raw) return !!WS_EVENTS_DISABLED_DEFAULT;
+    return raw === "1" || raw === "true";
+  } catch {
+    return !!WS_EVENTS_DISABLED_DEFAULT;
+  }
+}
+
+function setWsEventsDisabledSetting(next, options = {}) {
+  const { persist = true } = options || {};
+  wsEventsDisabled = !!next;
+  if (ui?.wsEventsDisabledToggle) {
+    ui.wsEventsDisabledToggle.checked = !wsEventsDisabled;
+  }
+  if (persist) {
+    try {
+      window?.localStorage?.setItem?.(
+        WS_EVENTS_DISABLED_STORAGE_KEY,
+        wsEventsDisabled ? "1" : "0"
+      );
+    } catch {}
+  }
+  try {
+    if (ui?.balanceMonitor && typeof ui.balanceMonitor.setWsEventsFeatureDisabled === "function") {
+      ui.balanceMonitor.setWsEventsFeatureDisabled(wsEventsDisabled, {
+        persist: false,
+        clearList: wsEventsDisabled,
+      });
+    }
+  } catch {}
+  if (wsEventsDisabled) {
+    wsEventQueue = [];
+  }
+  setWebhooksPaidFilterControlDisabled(wsEventsDisabled);
+}
+
+function setWebhooksPaidEventsFilterEnabled(next, options = {}) {
+  const { persist = true } = options || {};
+  const enabled = !!next;
+  if (ui?.webhooksPaidFilterToggle) {
+    ui.webhooksPaidFilterToggle.checked = enabled;
+  }
+  try {
+    if (ui?.balanceMonitor && typeof ui.balanceMonitor.setWebhooksPaidFilterEnabled === "function") {
+      ui.balanceMonitor.setWebhooksPaidFilterEnabled(enabled, { persist, render: true });
+      return;
+    }
+  } catch {}
+  if (persist) {
+    try {
+      window?.localStorage?.setItem?.(WS_WEBHOOK_FILTER_STORAGE_KEY, enabled ? "1" : "0");
+    } catch {}
+  }
+}
+
 function normalizeLettersOpenHotkeyInput(value) {
   const raw = String(value || "")
     .trim()
@@ -1889,6 +2421,23 @@ function setProfilePhotoHotkey(next, options = {}) {
   }
   if (persist) {
     setStore({ [PROFILE_PHOTO_HOTKEY_STORAGE_KEY]: profilePhotoHotkey });
+  }
+}
+
+function setTranslateSendHotkey(next, options = {}) {
+  const { persist = true } = options || {};
+  const normalized = normalizeLettersOpenHotkeyInput(next);
+  translateSendHotkey = normalized || TRANSLATE_SEND_HOTKEY_DEFAULT;
+  translateSendHotkeyParsed = parseLettersOpenHotkey(translateSendHotkey);
+  if (!translateSendHotkeyParsed) {
+    translateSendHotkey = TRANSLATE_SEND_HOTKEY_DEFAULT;
+    translateSendHotkeyParsed = parseLettersOpenHotkey(translateSendHotkey);
+  }
+  if (ui?.translateSendHotkeyInput) {
+    ui.translateSendHotkeyInput.value = translateSendHotkey;
+  }
+  if (persist) {
+    setStore({ [TRANSLATE_SEND_HOTKEY_STORAGE_KEY]: translateSendHotkey });
   }
 }
 
@@ -1968,6 +2517,246 @@ function handleProfilePhotoBindHotkey(event) {
     event.preventDefault();
     event.stopPropagation();
     target.click();
+  } catch {}
+}
+
+function isTranslateSendHotkeyPressed(event) {
+  return isHotkeyPressed(event, translateSendHotkeyParsed);
+}
+
+function findTranslateButton() {
+  const direct =
+    document.querySelector('[data-testid="translate-btn"]') ||
+    document.querySelector(".translate-btn") ||
+    document.querySelector("button.translate-btn");
+  if (direct) return direct;
+  const arrowIcon = document.querySelector(
+    'svg[data-testid="ArrowForwardIcon"], [data-testid="ArrowForwardIcon"]'
+  );
+  if (!arrowIcon) return null;
+  return (
+    arrowIcon.closest('[data-testid="translate-btn"]') ||
+    arrowIcon.closest("button") ||
+    arrowIcon.closest('[class*="translate_arrow__"]') ||
+    arrowIcon.parentElement
+  );
+}
+
+function getLetterComposerTextareas() {
+  try {
+    const wrap = document.querySelector('[data-testid="letter-actions"]');
+    if (!wrap) return [];
+    const nodes = Array.from(
+      wrap.querySelectorAll(
+        'textarea[class*="chat_textarea_inner__"], textarea.FormLetters_clmn_3_chat_textarea_inner__l5OUR'
+      )
+    ).filter(Boolean);
+    return nodes;
+  } catch {
+    return [];
+  }
+}
+
+function getLetterTranslatedTextarea() {
+  const textareas = getLetterComposerTextareas();
+  return textareas.length >= 2 ? textareas[1] : null;
+}
+
+function getLetterTranslatedBlock() {
+  const textarea = getLetterTranslatedTextarea();
+  return textarea?.closest?.('[class*="chat_textarea_wrap__"]') || null;
+}
+
+function findSendButton() {
+  return (
+    document.querySelector('[data-testid="send-btn"]') ||
+    document.querySelector(".send-btn") ||
+    document.querySelector("button.send-btn")
+  );
+}
+
+function triggerUiClick(target, options = {}) {
+  const { synthetic = true } = options || {};
+  if (!target) return false;
+  if (synthetic) {
+    dispatchSyntheticMouseSequence(target);
+  }
+  try {
+    if (typeof target.click === "function") {
+      target.click();
+      return true;
+    }
+  } catch {}
+  return false;
+}
+
+function getTranslatedTextBlockTextarea() {
+  return (
+    document.querySelector(
+      '[data-testid="translated-text-block"] textarea[data-testid="text"]'
+    ) ||
+    document.querySelector(
+      '[data-testid="translated-text-block"] .styles_clmn_3_chat_textarea_inner__DZxvk'
+    ) ||
+    getLetterTranslatedTextarea()
+  );
+}
+
+function dispatchSyntheticMouseSequence(target) {
+  if (!target || typeof target.dispatchEvent !== "function") return;
+  const base = { bubbles: true, cancelable: true, view: window };
+  const types = ["pointerdown", "mousedown", "pointerup", "mouseup"];
+  for (const type of types) {
+    try {
+      const Ctor =
+        type.startsWith("pointer") && typeof PointerEvent === "function"
+          ? PointerEvent
+          : MouseEvent;
+      target.dispatchEvent(new Ctor(type, base));
+    } catch {}
+  }
+}
+
+function isTranslatedInputActive() {
+  const target = getTranslatedTextBlockTextarea();
+  if (!target) return false;
+  const active = document.activeElement;
+  if (!active) return false;
+  if (active === target) return true;
+  const letterTranslated = getLetterTranslatedTextarea();
+  if (letterTranslated && (active === letterTranslated || letterTranslated.contains?.(active))) {
+    return true;
+  }
+  const letterBlock = getLetterTranslatedBlock();
+  if (letterBlock && (active === letterBlock || letterBlock.contains?.(active))) {
+    return true;
+  }
+  return !!(
+    active.closest?.('[data-testid="translated-text-block"]')
+  );
+}
+
+function isChatComposerFocused() {
+  const active = document.activeElement;
+  if (!active) return false;
+  if (
+    active.matches?.(CHAT_INPUT_SELECTORS.join(",")) ||
+    active.matches?.('textarea,[contenteditable="true"],[contenteditable=""]')
+  ) {
+    return true;
+  }
+  return !!active.closest?.(
+    '[class*="styles_clmn_3_chat_textarea__"],[class*="chat_textarea"],[data-testid="chat-input-area"]'
+  );
+}
+
+async function clickSendAfterTranslate() {
+  await new Promise((resolve) => setTimeout(resolve, 260));
+  const maxAttempts = 30;
+  for (let index = 0; index < maxAttempts; index += 1) {
+    activateTranslatedInputBeforeSend();
+    const sendBtn = findSendButton();
+    if (
+      sendBtn &&
+      !sendBtn.disabled &&
+      String(sendBtn.getAttribute("aria-disabled") || "").toLowerCase() !== "true" &&
+      isTranslatedInputActive()
+    ) {
+      triggerUiClick(sendBtn, { synthetic: false });
+      return true;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 80));
+  }
+  return false;
+}
+
+function activateChatInputBeforeSend() {
+  const selectors = [
+    ".styles_clmn_3_chat_textarea_inner__DZxvk",
+    '[class*="styles_clmn_3_chat_textarea_inner__"]',
+    "textarea.letter-input",
+    "[data-testid='letter-input']",
+    '[contenteditable="true"]',
+  ];
+  for (const selector of selectors) {
+    const target = document.querySelector(selector);
+    if (!target) continue;
+    try {
+      if (typeof target.focus === "function") {
+        target.focus({ preventScroll: true });
+      }
+    } catch {}
+    try {
+      if (typeof target.click === "function") {
+        target.click();
+      }
+    } catch {}
+    return true;
+  }
+  return false;
+}
+
+function activateTranslatedInputBeforeSend() {
+  const block =
+    document.querySelector('[data-testid="translated-text-block"]') ||
+    document.querySelector('[class*="chat_textarea_wrap"][data-testid*="translated"]') ||
+    getLetterTranslatedBlock();
+  const target =
+    getTranslatedTextBlockTextarea() ||
+    block?.querySelector?.("textarea,[contenteditable='true'],[contenteditable='']");
+  if (!block && !target) return false;
+  if (block) {
+    dispatchSyntheticMouseSequence(block);
+  }
+  if (target) {
+    dispatchSyntheticMouseSequence(target);
+  }
+  try {
+    if (typeof target.focus === "function") {
+      target.focus({ preventScroll: true });
+    }
+  } catch {}
+  try {
+    if (typeof target.click === "function") {
+      target.click();
+    }
+  } catch {}
+  try {
+    if (target instanceof HTMLTextAreaElement) {
+      const length = String(target.value || "").length;
+      target.setSelectionRange(length, length);
+    }
+  } catch {}
+  return true;
+}
+
+function handleTranslateSendBindHotkey(event) {
+  try {
+    if (!isTranslateSendHotkeyPressed(event)) return;
+    if (translateSendHotkeyInFlight) return;
+    const hasChatBlocks = !!document.querySelector(
+      '[data-testid="real-text-block"],[data-testid="translated-text-block"],[data-testid="letter-actions"]'
+    );
+    if (!hasChatBlocks && !isChatComposerFocused()) return;
+    const translateBtn = findTranslateButton();
+    const sendBtn = findSendButton();
+    if (!translateBtn && !sendBtn) return;
+    event.preventDefault();
+    event.stopPropagation();
+    translateSendHotkeyInFlight = true;
+    if (translateBtn) triggerUiClick(translateBtn);
+    setTimeout(() => {
+      if (!activateTranslatedInputBeforeSend()) {
+        activateChatInputBeforeSend();
+      }
+    }, 120);
+    clickSendAfterTranslate()
+      .catch(() => {})
+      .finally(() => {
+        setTimeout(() => {
+          translateSendHotkeyInFlight = false;
+        }, 200);
+      });
   } catch {}
 }
 
@@ -2475,6 +3264,464 @@ async function getProfileStatsApiBase() {
   return base;
 }
 
+function getRatingDayKeyKyiv() {
+  return getKyivDayKey(Date.now());
+}
+
+function normalizeRatingScope(value) {
+  return value === "all_time" ? "all_time" : "shift";
+}
+
+function normalizeRatingMetric(value) {
+  return value === "actions" ? "actions" : "balance";
+}
+
+function normalizeRatingMainTab(value) {
+  return value === "shift_actions" || value === "all_time" ? value : "shift_balance";
+}
+
+function normalizeRatingAllTimeSubTab(value) {
+  return value === "actions" ? "actions" : "balance";
+}
+
+function getRatingQueryByView(mainTab, allTimeSubTab) {
+  const normalizedMain = normalizeRatingMainTab(mainTab);
+  const normalizedSubTab = normalizeRatingAllTimeSubTab(allTimeSubTab);
+  if (normalizedMain === "shift_actions") {
+    return { metric: "actions", scope: "shift" };
+  }
+  if (normalizedMain === "all_time") {
+    return { metric: normalizedSubTab, scope: "all_time" };
+  }
+  return { metric: "balance", scope: "shift" };
+}
+
+function getOperatorRatingCacheKey({ metric, scope, dayKey }) {
+  const m = normalizeRatingMetric(metric);
+  const s = normalizeRatingScope(scope);
+  return `rating:${m}:${s}:${s === "shift" ? dayKey || getRatingDayKeyKyiv() : "all"}`;
+}
+
+function normalizeOperatorIdString(value) {
+  const raw = String(value ?? "").trim();
+  if (!raw) return "";
+  const digits = raw.replace(/\D/g, "");
+  return digits || raw;
+}
+
+function sortRatingItems(items, metric) {
+  const normalizedMetric = normalizeRatingMetric(metric);
+  const arr = Array.isArray(items) ? items.slice() : [];
+  arr.sort((a, b) => {
+    const valueA = Number(a?.value) || 0;
+    const valueB = Number(b?.value) || 0;
+    if (valueB !== valueA) return valueB - valueA;
+    if (normalizedMetric === "actions") {
+      const totalA = Number(a?.actions_total) || 0;
+      const totalB = Number(b?.actions_total) || 0;
+      if (totalB !== totalA) return totalB - totalA;
+    } else {
+      const balA = Number(a?.balance_total ?? a?.value) || 0;
+      const balB = Number(b?.balance_total ?? b?.value) || 0;
+      if (balB !== balA) return balB - balA;
+    }
+    const idA = Number(normalizeOperatorIdString(a?.operator_id)) || 0;
+    const idB = Number(normalizeOperatorIdString(b?.operator_id)) || 0;
+    return idA - idB;
+  });
+  return arr;
+}
+
+async function fetchOperatorsRating({ metric, scope, limit = OPERATOR_RATING_LIMIT }) {
+  const normalizedMetric = normalizeRatingMetric(metric);
+  const normalizedScope = normalizeRatingScope(scope);
+  const base = await getProfileStatsApiBase();
+  if (!base) {
+    throw new Error("Сервер недоступен");
+  }
+  const params = new URLSearchParams();
+  params.set("metric", normalizedMetric);
+  params.set("scope", normalizedScope);
+  params.set("limit", String(Math.max(1, Number(limit) || OPERATOR_RATING_LIMIT)));
+  const dayKey = getRatingDayKeyKyiv();
+  if (normalizedScope === "shift") {
+    params.set("day_key", dayKey);
+  }
+  const url = `${base}${OPERATOR_RATING_ENDPOINT}?${params.toString()}`;
+  let response;
+  try {
+    response = await fetch(url, { method: "GET" });
+  } catch {
+    throw new Error("Сервер недоступен");
+  }
+  if (!response?.ok) {
+    throw new Error(`HTTP ${response?.status || 0}`);
+  }
+  const payload = await response.json().catch(() => null);
+  if (!payload || payload.ok !== true) {
+    throw new Error("invalid_payload");
+  }
+  const items = sortRatingItems(payload.items, normalizedMetric).slice(0, OPERATOR_RATING_LIMIT);
+  return {
+    metric: normalizedMetric,
+    scope: normalizedScope,
+    dayKey: normalizedScope === "shift" ? dayKey : "all",
+    updatedAt: Number(payload.updated_at) || Date.now(),
+    items,
+  };
+}
+
+async function getOperatorsRatingCached({ metric, scope, force = false }) {
+  const normalizedMetric = normalizeRatingMetric(metric);
+  const normalizedScope = normalizeRatingScope(scope);
+  const dayKey = normalizedScope === "shift" ? getRatingDayKeyKyiv() : "all";
+  const key = getOperatorRatingCacheKey({
+    metric: normalizedMetric,
+    scope: normalizedScope,
+    dayKey,
+  });
+  const now = Date.now();
+  const cached = operatorRatingState.cache.get(key);
+  if (!force && cached && Number(cached.expiresAt) > now) {
+    return cached;
+  }
+  const inFlight = operatorRatingState.inFlight.get(key);
+  if (inFlight) {
+    return inFlight;
+  }
+  const requestPromise = (async () => {
+    const next = await fetchOperatorsRating({
+      metric: normalizedMetric,
+      scope: normalizedScope,
+      limit: OPERATOR_RATING_LIMIT,
+    });
+    const entry = {
+      ...next,
+      expiresAt: Date.now() + OPERATOR_RATING_CACHE_TTL_MS,
+    };
+    operatorRatingState.cache.set(key, entry);
+    return entry;
+  })();
+  operatorRatingState.inFlight.set(key, requestPromise);
+  try {
+    return await requestPromise;
+  } finally {
+    operatorRatingState.inFlight.delete(key);
+  }
+}
+
+function formatRatingUpdatedAt(ts) {
+  const value = Number(ts);
+  if (!Number.isFinite(value) || value <= 0) return "";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "";
+  try {
+    return date.toLocaleTimeString("ru-RU", {
+      hour: "2-digit",
+      minute: "2-digit",
+    });
+  } catch {
+    return date.toTimeString().slice(0, 5);
+  }
+}
+
+function getOperatorRatingCurrentOperatorId() {
+  return normalizeOperatorIdString(operatorInfoState?.operatorId);
+}
+
+function createOperatorRatingPanelDom() {
+  const root = document.createElement("div");
+  root.className = "rating-panel";
+  const mainTabs = document.createElement("div");
+  mainTabs.className = "rating-main-tabs";
+  const tabShiftBalance = document.createElement("button");
+  tabShiftBalance.type = "button";
+  tabShiftBalance.className = "rating-main-tab";
+  tabShiftBalance.dataset.mainTab = "shift_balance";
+  const tabShiftActions = document.createElement("button");
+  tabShiftActions.type = "button";
+  tabShiftActions.className = "rating-main-tab";
+  tabShiftActions.dataset.mainTab = "shift_actions";
+  const tabAllTime = document.createElement("button");
+  tabAllTime.type = "button";
+  tabAllTime.className = "rating-main-tab";
+  tabAllTime.dataset.mainTab = "all_time";
+  mainTabs.appendChild(tabShiftBalance);
+  mainTabs.appendChild(tabShiftActions);
+  mainTabs.appendChild(tabAllTime);
+  const subTabs = document.createElement("div");
+  subTabs.className = "rating-sub-tabs";
+  const subBalance = document.createElement("button");
+  subBalance.type = "button";
+  subBalance.className = "rating-sub-tab";
+  subBalance.dataset.subTab = "balance";
+  const subActions = document.createElement("button");
+  subActions.type = "button";
+  subActions.className = "rating-sub-tab";
+  subActions.dataset.subTab = "actions";
+  subTabs.appendChild(subBalance);
+  subTabs.appendChild(subActions);
+  const tableWrap = document.createElement("div");
+  tableWrap.className = "rating-table-wrap";
+  const updated = document.createElement("div");
+  updated.className = "rating-updated-at";
+  root.appendChild(mainTabs);
+  root.appendChild(subTabs);
+  root.appendChild(tableWrap);
+  root.appendChild(updated);
+  return {
+    root,
+    mainTabs: {
+      shiftBalance: tabShiftBalance,
+      shiftActions: tabShiftActions,
+      allTime: tabAllTime,
+    },
+    subTabs: {
+      balance: subBalance,
+      actions: subActions,
+    },
+    tableWrap,
+    updated,
+  };
+}
+
+function updateOperatorRatingPanelTexts(panelDom) {
+  if (!panelDom) return;
+  panelDom.mainTabs.shiftBalance.textContent =
+    t("ratingMainShiftBalance") || "Баланс за смену";
+  panelDom.mainTabs.shiftActions.textContent =
+    t("ratingMainShiftActions") || "Действия за смену";
+  panelDom.mainTabs.allTime.textContent = t("ratingTabAllTime") || "За всё время";
+  panelDom.subTabs.balance.textContent = t("ratingTitleBalance") || "Балансы";
+  panelDom.subTabs.actions.textContent = t("ratingTitleActions") || "Действия";
+}
+
+function getMsUntilNextKyivHourBoundary() {
+  try {
+    const parts = kyivParts(Date.now());
+    const hour = Number(parts?.hh) || 0;
+    const minute = Number(parts?.mm) || 0;
+    const second = Number(parts?.ss) || 0;
+    const currentSeconds = hour * 3600 + minute * 60 + second;
+    const nextSeconds = (hour + 1) * 3600;
+    const diff = nextSeconds - currentSeconds;
+    return Math.max(1000, diff * 1000);
+  } catch {
+    return 60 * 60 * 1000;
+  }
+}
+
+function clearOperatorRatingHourlyRefresh() {
+  if (operatorRatingHourlyTimerId) {
+    clearTimeout(operatorRatingHourlyTimerId);
+    operatorRatingHourlyTimerId = null;
+  }
+}
+
+function scheduleOperatorRatingHourlyRefresh() {
+  clearOperatorRatingHourlyRefresh();
+  const delay = getMsUntilNextKyivHourBoundary();
+  operatorRatingHourlyTimerId = setTimeout(() => {
+    operatorRatingHourlyTimerId = null;
+    renderOperatorRatingTables({ force: true }).catch(() => {});
+    scheduleOperatorRatingHourlyRefresh();
+  }, delay);
+}
+
+function switchOperatorRatingMainTab(nextMainTab) {
+  operatorRatingState.activeMainTab = normalizeRatingMainTab(nextMainTab);
+  renderOperatorRatingTables({ force: false }).catch(() => {});
+}
+
+function switchOperatorRatingAllTimeSubTab(nextSubTab) {
+  operatorRatingState.activeAllTimeSubTab = normalizeRatingAllTimeSubTab(nextSubTab);
+  renderOperatorRatingTables({ force: false }).catch(() => {});
+}
+
+function buildRatingTableRows({ metric, scope, items }) {
+  const normalizedMetric = normalizeRatingMetric(metric);
+  const normalizedScope = normalizeRatingScope(scope);
+  const isBalance = normalizedMetric === "balance";
+  const showActionColumns = !isBalance;
+  const rows = [];
+  const currentOperatorId = getOperatorRatingCurrentOperatorId();
+  const header = document.createElement("div");
+  header.className = `rating-row rating-row-header ${isBalance ? "rating-row-balance" : "rating-row-actions"}`;
+  header.innerHTML = isBalance
+    ? `
+    <span>${escapeHtml(t("ratingColRank") || "#")}</span>
+    <span>${escapeHtml(t("ratingColName") || "Имя")}</span>
+    <span>${escapeHtml(t("ratingColValue") || "Баланс")}</span>
+  `.trim()
+    : `
+    <span>${escapeHtml(t("ratingColRank") || "#")}</span>
+    <span>${escapeHtml(t("ratingColName") || "Имя")}</span>
+    <span>${escapeHtml(t("ratingColChat") || "Чаты")}</span>
+    <span>${escapeHtml(t("ratingColMail") || "Письма")}</span>
+    <span>${escapeHtml(t("ratingColTotal") || "Всего")}</span>
+  `.trim();
+  rows.push(header);
+  items.forEach((item, index) => {
+    const operatorId = normalizeOperatorIdString(item?.operator_id);
+    const operatorName = String(item?.operator_name || "").trim() || `ID ${operatorId || "—"}`;
+    const valueRaw = Number(item?.value) || 0;
+    const value = valueRaw.toFixed(2);
+    const chat = String(Math.max(0, Number(item?.chat_count) || 0));
+    const mail = String(Math.max(0, Number(item?.mail_count) || 0));
+    const total = String(
+      Math.max(
+        0,
+        Number(item?.actions_total) || (Number(item?.chat_count) || 0) + (Number(item?.mail_count) || 0)
+      )
+    );
+    const row = document.createElement("div");
+    row.className = `rating-row ${isBalance ? "rating-row-balance" : "rating-row-actions"}`;
+    if (currentOperatorId && operatorId && currentOperatorId === operatorId) {
+      row.classList.add("is-current");
+    }
+    if (isBalance) {
+      row.innerHTML = `
+        <span>${index + 1}</span>
+        <span title="${escapeHtml(operatorName)}">${escapeHtml(operatorName)}</span>
+        <span>${escapeHtml(value)}</span>
+      `.trim();
+    } else {
+      row.innerHTML = `
+        <span>${index + 1}</span>
+        <span title="${escapeHtml(operatorName)}">${escapeHtml(operatorName)}</span>
+        <span>${escapeHtml(chat)}</span>
+        <span>${escapeHtml(mail)}</span>
+        <span>${escapeHtml(total)}</span>
+      `.trim();
+    }
+    if (showActionColumns && normalizedScope === "all_time") {
+      row.dataset.scope = "all_time";
+    }
+    rows.push(row);
+  });
+  return rows;
+}
+
+function renderOperatorRatingPanelState({ panelDom, loading, error, payload, metric, scope }) {
+  if (!panelDom) return;
+  const activeMainTab = normalizeRatingMainTab(operatorRatingState.activeMainTab);
+  const activeSubTab = normalizeRatingAllTimeSubTab(operatorRatingState.activeAllTimeSubTab);
+  updateOperatorRatingPanelTexts(panelDom);
+  panelDom.mainTabs.shiftBalance.classList.toggle("active", activeMainTab === "shift_balance");
+  panelDom.mainTabs.shiftActions.classList.toggle("active", activeMainTab === "shift_actions");
+  panelDom.mainTabs.allTime.classList.toggle("active", activeMainTab === "all_time");
+  const showSubTabs = activeMainTab === "all_time";
+  panelDom.subTabs.balance.classList.toggle("active", activeSubTab === "balance");
+  panelDom.subTabs.actions.classList.toggle("active", activeSubTab === "actions");
+  panelDom.root.classList.toggle("show-all-time-subtabs", showSubTabs);
+  panelDom.tableWrap.innerHTML = "";
+  if (loading) {
+    const node = document.createElement("div");
+    node.className = "rating-loading";
+    node.textContent = t("ratingLoading") || "Загрузка рейтинга...";
+    panelDom.tableWrap.appendChild(node);
+    panelDom.updated.textContent = "";
+    return;
+  }
+  if (error) {
+    const node = document.createElement("div");
+    node.className = "rating-error";
+    node.textContent = t("ratingError") || "Не удалось загрузить рейтинг";
+    panelDom.tableWrap.appendChild(node);
+    panelDom.updated.textContent = "";
+    return;
+  }
+  const items = Array.isArray(payload?.items) ? payload.items : [];
+  if (!items.length) {
+    const node = document.createElement("div");
+    node.className = "rating-empty";
+    node.textContent = t("ratingEmpty") || "Нет данных";
+    panelDom.tableWrap.appendChild(node);
+    panelDom.updated.textContent = "";
+    return;
+  }
+  const rows = buildRatingTableRows({ metric, scope, items });
+  rows.forEach((row) => panelDom.tableWrap.appendChild(row));
+  const updatedAt = formatRatingUpdatedAt(payload?.updatedAt);
+  panelDom.updated.textContent = updatedAt
+    ? `${t("ratingUpdatedAt") || "Обновлено"}: ${updatedAt}`
+    : "";
+}
+
+async function renderOperatorRatingPanel({ force = false }) {
+  if (!operatorRatingPanelDom) return;
+  const query = getRatingQueryByView(
+    operatorRatingState.activeMainTab,
+    operatorRatingState.activeAllTimeSubTab
+  );
+  renderOperatorRatingPanelState({
+    panelDom: operatorRatingPanelDom,
+    loading: true,
+    error: false,
+    payload: null,
+    metric: query.metric,
+    scope: query.scope,
+  });
+  try {
+    const payload = await getOperatorsRatingCached({
+      metric: query.metric,
+      scope: query.scope,
+      force,
+    });
+    renderOperatorRatingPanelState({
+      panelDom: operatorRatingPanelDom,
+      loading: false,
+      error: false,
+      payload,
+      metric: query.metric,
+      scope: query.scope,
+    });
+  } catch {
+    renderOperatorRatingPanelState({
+      panelDom: operatorRatingPanelDom,
+      loading: false,
+      error: true,
+      payload: null,
+      metric: query.metric,
+      scope: query.scope,
+    });
+  }
+}
+
+async function renderOperatorRatingTables({ force = false } = {}) {
+  if (!operatorRatingPanelRoot) return;
+  await renderOperatorRatingPanel({ force });
+  operatorRatingState.lastRenderAt = Date.now();
+}
+
+function initOperatorRatingPanel(chartCol) {
+  if (!chartCol) return;
+  chartCol.innerHTML = "";
+  const root = document.createElement("div");
+  root.className = "rating-panels";
+  const panelDom = createOperatorRatingPanelDom();
+  root.appendChild(panelDom.root);
+  chartCol.appendChild(root);
+  operatorRatingPanelRoot = root;
+  operatorRatingPanelDom = panelDom;
+  panelDom.mainTabs.shiftBalance.addEventListener("click", () => {
+    switchOperatorRatingMainTab("shift_balance");
+  });
+  panelDom.mainTabs.shiftActions.addEventListener("click", () => {
+    switchOperatorRatingMainTab("shift_actions");
+  });
+  panelDom.mainTabs.allTime.addEventListener("click", () => {
+    switchOperatorRatingMainTab("all_time");
+  });
+  panelDom.subTabs.balance.addEventListener("click", () => {
+    switchOperatorRatingAllTimeSubTab("balance");
+  });
+  panelDom.subTabs.actions.addEventListener("click", () => {
+    switchOperatorRatingAllTimeSubTab("actions");
+  });
+  renderOperatorRatingTables({ force: false }).catch(() => {});
+}
+
 function parseNameAge(str) {
   const raw0 = (str || "").trim();
   if (!raw0) return { name: "", age: "" };
@@ -2666,6 +3913,33 @@ function ensureLocalTimeStyles() {
   font-size:11px;
   letter-spacing:-0.03em;
   color:hsla(0, 0%, 100%, .9);
+}
+.${MAN_ID_BALANCE_WRAP_CLASS}{
+  display:inline-flex;
+  align-items:center;
+  gap:6px;
+  min-width:0;
+  max-width:100%;
+}
+.${MAN_SPEND_CLASS}{
+  display:inline-flex;
+  align-items:center;
+  gap:4px;
+  font-size:11px;
+  letter-spacing:-0.02em;
+  color:hsla(0, 0%, 100%, .9);
+  white-space:nowrap;
+}
+.${MAN_SPEND_CLASS}::before{
+  content:"";
+  display:inline-block;
+  width:12px;
+  height:12px;
+  background-image:url("${ICONS.money}");
+  background-repeat:no-repeat;
+  background-position:center;
+  background-size:contain;
+  opacity:.95;
 }
 [data-testid="chat-header"] [class*="styles_clmn_3_chat_head_profile_info__"],
 [data-testid="chat-header"] [class*="chat_head_profile_info__"]{
@@ -3115,6 +4389,174 @@ function buildManTimeLabel(city, countryCode) {
   return buildWomanTimeLabel(city, countryCode);
 }
 
+function getActiveChatUidForSpend() {
+  try {
+    const path = String(window.location.pathname || "");
+    const match = path.match(/^\/(?:chat|letter)\/([^/?#]+)/i);
+    if (match && match[1]) return decodeURIComponent(match[1]);
+  } catch {}
+  return String(activeChatUidCache || "").trim();
+}
+
+function getActiveChatIdForSpend() {
+  try {
+    const href = String(window.location.href || "");
+    const match = href.match(/[?&]chat_id=(\d+)/i);
+    if (match && match[1]) return match[1];
+  } catch {}
+  return "";
+}
+
+async function ensureManSpendDataForActiveChat() {
+  const chatUid = getActiveChatUidForSpend();
+  if (!chatUid) return false;
+  const now = Date.now();
+  const existingEntry = manSpendByChatUid.get(chatUid);
+  if (
+    existingEntry &&
+    Number.isFinite(Number(existingEntry.updated_at)) &&
+    now - Number(existingEntry.updated_at) < HEADER_CHAT_HISTORY_SPEND_REFRESH_TTL_MS
+  ) {
+    return true;
+  }
+  const cached = wsChatHistorySpendCache.get(chatUid);
+  if (cached && Number(cached.expiresAt) > now) {
+    if (!existingEntry) {
+      upsertManSpendEntry({
+        chat_uid: chatUid,
+        chat_id: String(getActiveChatIdForSpend() || "").trim(),
+        max_spend_all_credits: Number(cached.maxSpend) || 0,
+        man_external_id: "",
+        woman_external_id: "",
+        updated_at: now,
+      });
+    }
+    return true;
+  }
+  const inFlight = headerChatHistorySpendInFlight.get(chatUid);
+  if (inFlight) {
+    try {
+      return await inFlight;
+    } catch {
+      return false;
+    }
+  }
+  const requestPromise = (async () => {
+    const token = (await getAuthTokenForConfigCheck()) || getAuthTokenFromStorage();
+    if (!token) return false;
+    const payload = await fetchWsChatHistoryPageOne({
+      token,
+      chatUid,
+    });
+    if (!payload || typeof payload !== "object") return false;
+    const maxSpend = extractMaxSpendAllCreditsFromChatHistory(payload);
+    const list = Array.isArray(payload?.response) ? payload.response : [];
+    const firstRow = list.find((row) => row && typeof row === "object") || null;
+    let manExternalId = normalizeExternalId(firstRow?.sender_external_id);
+    let womanExternalId = normalizeExternalId(firstRow?.recipient_external_id);
+    if (!manExternalId || !womanExternalId) {
+      try {
+        const ctx = readContext();
+        if (!manExternalId) manExternalId = normalizeExternalId(ctx?.man?.id);
+        if (!womanExternalId) womanExternalId = normalizeExternalId(ctx?.woman?.id);
+      } catch {}
+    }
+    const chatId =
+      String(firstRow?.chat_id || "").trim() || String(getActiveChatIdForSpend() || "").trim();
+    const updatedAt = Date.now();
+    upsertManSpendEntry({
+      chat_uid: chatUid,
+      chat_id: chatId,
+      max_spend_all_credits: maxSpend,
+      man_external_id: manExternalId,
+      woman_external_id: womanExternalId,
+      updated_at: updatedAt,
+    });
+    wsChatHistorySpendCache.set(chatUid, {
+      hasSpend: maxSpend > 0,
+      maxSpend,
+      expiresAt: updatedAt + HEADER_CHAT_HISTORY_SPEND_REFRESH_TTL_MS,
+    });
+    return true;
+  })();
+  headerChatHistorySpendInFlight.set(chatUid, requestPromise);
+  try {
+    return await requestPromise;
+  } catch {
+    return false;
+  } finally {
+    headerChatHistorySpendInFlight.delete(chatUid);
+  }
+}
+
+function ensureManIdBalanceContainer() {
+  try {
+    const header = document.querySelector('[data-testid="chat-header"]');
+    if (!header) return null;
+    const profileIdEl =
+      header.querySelector(MAN_PROFILE_ID_SELECTOR_PRIMARY) ||
+      header.querySelector(MAN_PROFILE_ID_SELECTOR_FALLBACK);
+    if (!profileIdEl) return null;
+    let wrap = profileIdEl.parentElement;
+    if (!wrap || !wrap.classList?.contains(MAN_ID_BALANCE_WRAP_CLASS)) {
+      wrap = document.createElement("span");
+      wrap.className = MAN_ID_BALANCE_WRAP_CLASS;
+      profileIdEl.insertAdjacentElement("beforebegin", wrap);
+      wrap.appendChild(profileIdEl);
+    }
+    let spendEl = wrap.querySelector(`.${MAN_SPEND_CLASS}`);
+    if (!spendEl) {
+      spendEl = document.createElement("span");
+      spendEl.className = MAN_SPEND_CLASS;
+      wrap.appendChild(spendEl);
+    }
+    return { wrap, spendEl };
+  } catch {
+    return null;
+  }
+}
+
+function renderManSpendValue(value) {
+  const num = Number(value);
+  if (!Number.isFinite(num) || num < 0) return "—";
+  const normalized = Number.isInteger(num) ? String(num) : String(num.toFixed(2)).replace(/\.?0+$/, "");
+  return normalized;
+}
+
+function updateManSpendInHeader() {
+  try {
+    const uiNodes = ensureManIdBalanceContainer();
+    if (!uiNodes?.spendEl) return;
+    ensureLocalTimeStyles();
+    const chatUid = getActiveChatUidForSpend();
+    let entry = chatUid ? manSpendByChatUid.get(chatUid) : null;
+    if (!entry) {
+      const chatId = getActiveChatIdForSpend();
+      if (chatId) entry = manSpendByChatId.get(chatId) || null;
+    }
+    if (!entry) {
+      const { man, woman } = readContext();
+      const pairKey = getManSpendPairKey(man?.id, woman?.id);
+      if (pairKey) {
+        entry = manSpendByPairKey.get(pairKey) || null;
+      }
+    }
+    uiNodes.spendEl.textContent = renderManSpendValue(entry?.max_spend_all_credits);
+    uiNodes.spendEl.title = "Потрачено кредитов в этом чате";
+    if (!entry) {
+      const startedForChatUid = chatUid;
+      void ensureManSpendDataForActiveChat()
+        .then((loaded) => {
+          if (!loaded) return;
+          const currentChatUid = getActiveChatUidForSpend();
+          if (startedForChatUid && currentChatUid !== startedForChatUid) return;
+          updateManSpendInHeader();
+        })
+        .catch(() => {});
+    }
+  } catch {}
+}
+
 function updateWomanLocalTimeInHeader() {
   try {
     const info = getWomanPlaceInfo();
@@ -3191,6 +4633,7 @@ function startLocalTimeUpdates() {
   loadTimezoneData();
   updateWomanLocalTimeInHeader();
   updateManLocalTimeInHeader();
+  updateManSpendInHeader();
 }
 function readContext() {
   LOG.log("readContext: reading DOM...");
@@ -3232,6 +4675,9 @@ const MONITOR_COUNTER_RESET_HOUR = 2; // 02:00 Kyiv time
 const REPORTS_SHIFT_RESET_HOUR = 23; // 23:00 Kyiv time (reports only)
 const WS_EVENTS_STORAGE_KEY = "ot4et_ws_events";
 const WS_EVENTS_FALLBACK_STORAGE_KEY = "__ot4et_ws_events__";
+const WS_WEBHOOK_FILTER_STORAGE_KEY = "ot4et_ws_webhook_paid_filter";
+const WS_EVENTS_DISABLED_STORAGE_KEY = "ot4et_ws_events_disabled";
+const WS_EVENTS_DISABLED_DEFAULT = false;
 const ADMIN_READONLY_LATCH_STORAGE_KEY = "__ot4et_admin_readonly_latch__";
 const LOGO_WHITE_SQUARE_PROFILES_STORAGE_KEY = "logoProfilesCache";
 const LOGO_WHITE_SQUARE_BALANCE_STORAGE_KEY = "logoBalanceCache";
@@ -3346,6 +4792,9 @@ let lettersOpenHotkey = LETTERS_OPEN_HOTKEY_DEFAULT;
 let lettersOpenHotkeyParsed = null;
 let profilePhotoHotkey = PROFILE_PHOTO_HOTKEY_DEFAULT;
 let profilePhotoHotkeyParsed = null;
+let translateSendHotkey = TRANSLATE_SEND_HOTKEY_DEFAULT;
+let translateSendHotkeyParsed = null;
+let translateSendHotkeyInFlight = false;
 let settingsMenuOpen = false;
 let settingsMenuCleanup = null;
 let adminReadOnlyLatched = false;
@@ -3413,6 +4862,8 @@ const PROFILE_SWITCH_INLINE_CONTAINER_SELECTORS = [
   ".styles_clmn_1_mm_chat_offline_girls__D45SG",
   '[class*="styles_clmn_1_mm_chat_offline_girls__"]',
 ];
+const PROFILES_BLOCK_SELECTOR = '[data-testid="profiles-block"]';
+const PROFILES_LIST_SELECTOR = '[data-testid="profiles-list"]';
 const PROFILE_SWITCH_INLINE_TARGET_SELECTORS = [
   '[class*="ProfilesList_clmn_1_mm_chat_list_item_right__"]',
   '[class*="mm_chat_list_item_right__"]',
@@ -3424,6 +4875,7 @@ let profileSwitchInlineButtonEl = null;
 let profileSwitchPlacementObserver = null;
 let profileSwitchPlacementInitialized = false;
 let profileSwitchPlacementPending = false;
+let profilesViewportLayoutScheduled = false;
 let firstBalancePollPending = true;
 const LOGO_WHITE_SQUARE_SELECTORS = [
   ".SideMenu_clmn_1_logo__IPgoP",
@@ -3530,6 +4982,16 @@ let logoWhiteSquareExpandedDocHandler = null;
 let logoWhiteSquareExpandedKeyHandler = null;
 let logoWhiteSquareExpandedParent = null;
 let logoWhiteSquareExpandedHiddenNodes = null;
+let operatorRatingPanelRoot = null;
+let operatorRatingHourlyTimerId = null;
+let operatorRatingPanelDom = null;
+const operatorRatingState = {
+  activeMainTab: "shift_balance",
+  activeAllTimeSubTab: "balance",
+  cache: new Map(),
+  inFlight: new Map(),
+  lastRenderAt: 0,
+};
 
 function injectProfileSwitchInlineStyles() {
   try {
@@ -5111,10 +6573,67 @@ function scheduleProfileSwitchPlacement() {
   raf(() => ensureProfileSwitchInlinePlacement());
 }
 
+function applyProfilesViewportLayout() {
+  profilesViewportLayoutScheduled = false;
+  try {
+    const blocks = document.querySelectorAll(PROFILES_BLOCK_SELECTOR);
+    if (!blocks?.length) return;
+    const viewportHeight =
+      Number(window.innerHeight) ||
+      Number(document.documentElement?.clientHeight) ||
+      0;
+    if (!viewportHeight) return;
+    blocks.forEach((block) => {
+      if (!block) return;
+      const list = block.querySelector(PROFILES_LIST_SELECTOR);
+      if (!list) return;
+      const resetStyles = () => {
+        try {
+          block.style.removeProperty("max-height");
+          block.style.removeProperty("min-height");
+          block.style.removeProperty("display");
+          block.style.removeProperty("flex-direction");
+          list.style.removeProperty("height");
+          list.style.removeProperty("max-height");
+          list.style.removeProperty("overflow-y");
+          list.style.removeProperty("min-height");
+        } catch {}
+      };
+      if (!isNodeVisible(block)) {
+        resetStyles();
+        return;
+      }
+      const rect = block.getBoundingClientRect();
+      const top = Number(rect?.top) || 0;
+      const bottomGap = 10;
+      const available = Math.floor(viewportHeight - top - bottomGap);
+      if (available < 120) {
+        resetStyles();
+        return;
+      }
+      block.style.maxHeight = `${available}px`;
+      list.style.height = "auto";
+      list.style.maxHeight = `${Math.max(120, available - 54)}px`;
+      list.style.overflowY = "auto";
+      list.style.minHeight = "0";
+    });
+  } catch {}
+}
+
+function scheduleProfilesViewportLayout() {
+  if (profilesViewportLayoutScheduled) return;
+  profilesViewportLayoutScheduled = true;
+  const raf =
+    (typeof window !== "undefined" && window.requestAnimationFrame) ||
+    ((cb) => setTimeout(cb, 0));
+  raf(() => applyProfilesViewportLayout());
+}
+
 function startProfileSwitchMutationObserver() {
   if (profileSwitchPlacementObserver || !document.body) return false;
   profileSwitchPlacementObserver = new MutationObserver(() => {
     scheduleProfileSwitchPlacement();
+    scheduleProfilesViewportLayout();
   });
   profileSwitchPlacementObserver.observe(document.body, {
     childList: true,
@@ -5130,6 +6649,7 @@ function initProfileSwitchInlineButton() {
   }
   profileSwitchPlacementInitialized = true;
   scheduleProfileSwitchPlacement();
+  scheduleProfilesViewportLayout();
   try {
     if (!startProfileSwitchMutationObserver()) {
       document.addEventListener(
@@ -5137,10 +6657,19 @@ function initProfileSwitchInlineButton() {
         () => {
           startProfileSwitchMutationObserver();
           scheduleProfileSwitchPlacement();
+          scheduleProfilesViewportLayout();
         },
         { once: true }
       );
     }
+  } catch {}
+  try {
+    window.addEventListener("resize", scheduleProfilesViewportLayout, {
+      passive: true,
+    });
+    window.addEventListener("scroll", scheduleProfilesViewportLayout, {
+      passive: true,
+    });
   } catch {}
 }
 
@@ -6209,29 +7738,113 @@ function injectLogoWhiteSquareStyles() {
         overflow:hidden;
       }
       .${LOGO_WHITE_SQUARE_EXPANDED_CLASS} .${LOGO_WHITE_SQUARE_MENU_CLASS} .menu-column.menu-column-chart::before{
-        content:"";
-        position:absolute;
-        inset:0;
-        background:rgba(255,255,255,0.6);
-        backdrop-filter:blur(6px);
-        -webkit-backdrop-filter:blur(6px);
-        z-index:2;
-        pointer-events:none;
+        content:none;
       }
       .${LOGO_WHITE_SQUARE_EXPANDED_CLASS} .${LOGO_WHITE_SQUARE_MENU_CLASS} .menu-column.menu-column-chart::after{
-        content:"Скоро...";
-        position:absolute;
-        inset:0;
+        content:none;
+      }
+      .${LOGO_WHITE_SQUARE_MENU_CLASS} .rating-panels{
         display:flex;
+        flex-direction:column;
+        width:100%;
+        height:100%;
+        min-height:0;
+      }
+      .${LOGO_WHITE_SQUARE_MENU_CLASS} .rating-panel{
+        display:flex;
+        flex-direction:column;
+        gap:8px;
+        background:#fff;
+        border:1px solid rgba(31,79,116,0.12);
+        border-radius:8px;
+        padding:10px;
+        min-height:0;
+        flex:1 1 auto;
+      }
+      .${LOGO_WHITE_SQUARE_MENU_CLASS} .rating-main-tabs,
+      .${LOGO_WHITE_SQUARE_MENU_CLASS} .rating-sub-tabs{
+        display:flex;
+        gap:6px;
+      }
+      .${LOGO_WHITE_SQUARE_MENU_CLASS} .rating-sub-tabs{
+        display:none;
+      }
+      .${LOGO_WHITE_SQUARE_MENU_CLASS} .rating-panel.show-all-time-subtabs .rating-sub-tabs{
+        display:flex;
+      }
+      .${LOGO_WHITE_SQUARE_MENU_CLASS} .rating-main-tab,
+      .${LOGO_WHITE_SQUARE_MENU_CLASS} .rating-sub-tab{
+        flex:1 1 0;
+        border:1px solid rgba(31,79,116,0.18);
+        background:#f4f7fb;
+        color:#163656;
+        border-radius:4px;
+        padding:4px 6px;
+        font-size:12px;
+        font-weight:600;
+        cursor:pointer;
+      }
+      .${LOGO_WHITE_SQUARE_MENU_CLASS} .rating-main-tab.active,
+      .${LOGO_WHITE_SQUARE_MENU_CLASS} .rating-sub-tab.active{
+        background:#1f4f74;
+        color:#fff;
+        border-color:#1f4f74;
+      }
+      .${LOGO_WHITE_SQUARE_MENU_CLASS} .rating-table-wrap{
+        display:flex;
+        flex-direction:column;
+        gap:4px;
+        overflow:auto;
+        min-height:0;
+        flex:1 1 auto;
+      }
+      .${LOGO_WHITE_SQUARE_MENU_CLASS} .rating-row{
+        display:grid;
         align-items:center;
-        justify-content:center;
-        font-size:20px;
-        font-weight:700;
-        color:#0f2d4a;
-        z-index:3;
-        pointer-events:none;
+        gap:8px;
+        padding:4px 6px;
+        border-radius:4px;
+        font-size:11px;
+        font-weight:600;
+        color:#143852;
+        background:#f9fbff;
+      }
+      .${LOGO_WHITE_SQUARE_MENU_CLASS} .rating-row.rating-row-balance{
+        grid-template-columns: 34px minmax(120px,1fr) 110px;
+      }
+      .${LOGO_WHITE_SQUARE_MENU_CLASS} .rating-row.rating-row-actions{
+        grid-template-columns: 34px minmax(120px,1fr) 74px 74px 74px;
+      }
+      .${LOGO_WHITE_SQUARE_MENU_CLASS} .rating-row span{
+        overflow:hidden;
+        text-overflow:ellipsis;
+        white-space:nowrap;
+      }
+      .${LOGO_WHITE_SQUARE_MENU_CLASS} .rating-row.rating-row-header{
+        align-items:center;
+        background:#eef3f9;
+        color:#5f7285;
         text-transform:uppercase;
-        letter-spacing:0.06em;
+        letter-spacing:0.04em;
+        font-weight:700;
+      }
+      .${LOGO_WHITE_SQUARE_MENU_CLASS} .rating-row.is-current{
+        border:1px solid rgba(31,79,116,0.38);
+        background:#e8f0fb;
+      }
+      .${LOGO_WHITE_SQUARE_MENU_CLASS} .rating-loading,
+      .${LOGO_WHITE_SQUARE_MENU_CLASS} .rating-empty,
+      .${LOGO_WHITE_SQUARE_MENU_CLASS} .rating-error{
+        font-size:12px;
+        color:#5f7285;
+        padding:6px 4px;
+      }
+      .${LOGO_WHITE_SQUARE_MENU_CLASS} .rating-error{
+        color:#b03a2e;
+      }
+      .${LOGO_WHITE_SQUARE_MENU_CLASS} .rating-updated-at{
+        font-size:11px;
+        color:#6a7f91;
       }
       .${LOGO_WHITE_SQUARE_EXPANDED_CLASS} .${LOGO_WHITE_SQUARE_MENU_CLASS} .menu-column:last-child{margin-right:0;}
       .${LOGO_WHITE_SQUARE_EXPANDED_CLASS} .${LOGO_WHITE_SQUARE_MENU_CLASS} .menu-column:last-child{
@@ -7490,6 +9103,12 @@ function updateLogoWhiteSquareTexts() {
     });
   } catch {}
   renderLogoWhiteSquareProfilesList();
+  if (operatorRatingPanelDom) {
+    updateOperatorRatingPanelTexts(operatorRatingPanelDom);
+  }
+  if (operatorRatingPanelRoot) {
+    renderOperatorRatingTables({ force: false }).catch(() => {});
+  }
 }
 
 function setLogoWhiteSquareArrowExpanded(expanded) {
@@ -7655,6 +9274,7 @@ function getLogoWhiteSquareExpandedElement() {
     }
     const chartCol = document.createElement("div");
     chartCol.className = "menu-column menu-column-chart";
+    initOperatorRatingPanel(chartCol);
     columnsWrap.appendChild(chartCol);
     content.appendChild(columnsWrap);
   }
@@ -7747,6 +9367,8 @@ function openLogoWhiteSquareExpandedPanel() {
   panel.setAttribute("aria-hidden", "false");
   updateServerAccessUI();
   attachLogoWhiteSquareExpandedHandlers();
+  renderOperatorRatingTables({ force: false }).catch(() => {});
+  scheduleOperatorRatingHourlyRefresh();
   try {
     (async () => {
       try {
@@ -7770,6 +9392,7 @@ function openLogoWhiteSquareExpandedPanel() {
 
 function closeLogoWhiteSquareExpandedPanel() {
   if (!logoWhiteSquareExpandedEl || !logoWhiteSquareExpandedOpen) return;
+  clearOperatorRatingHourlyRefresh();
   logoWhiteSquareExpandedOpen = false;
   setLogoWhiteSquareArrowExpanded(false);
   logoWhiteSquareExpandedEl.classList.remove("open");
@@ -10266,7 +11889,7 @@ function buildPanel() {
       #adb-details{position:absolute;top:calc(100% + 8px);left:0;z-index:6;display:flex;flex-direction:column;gap:4px;padding:8px;border-radius:3px;border:1px solid rgba(31,79,116,0.15);background:var(--ar-elevated-bg, ${PANEL_ELEVATED_BG});box-shadow:0 10px 28px rgba(31,79,116,0.18);opacity:0;transform:translateY(-6px);pointer-events:none;transition:opacity .12s ease, transform .12s ease;box-sizing:border-box;overflow:hidden}
       #adb-details::before{content:"";position:absolute;top:-6px;left:var(--adb-pointer-left, 30px);width:12px;height:12px;background:inherit;border-left:1px solid rgba(31,79,116,0.15);border-top:1px solid rgba(31,79,116,0.15);transform:rotate(45deg);pointer-events:none}
       #adb-details.open{opacity:1;transform:translateY(0);pointer-events:auto}
-      #adb-details .adb-tools{display:flex;align-items:center;gap:12px;justify-content:flex-end;width:100%}
+      #adb-details .adb-tools{display:none}
       #adb-details .adb-tabs{display:flex;align-items:center;gap:6px;margin:2px 0 4px;width:100%}
       #adb-details .adb-tab{appearance:none;border:1px solid rgba(31,79,116,0.18);background:rgba(95,168,255,0.08);color:inherit;border-radius:3px;padding:2px 8px;font:12px/1.3 Consolas, monospace;cursor:pointer;flex:1 1 0;min-width:0;text-align:center}
       #adb-details .adb-tab:hover{background:rgba(95,168,255,0.14)}
@@ -10275,8 +11898,6 @@ function buildPanel() {
       #adb-details .adb-tab-panel{display:block}
       #adb-details .adb-tab-panel[hidden]{display:none !important}
       #adb-details .adb-actions{display:flex;align-items:center;gap:8px}
-      #adb-details .adb-tools button{background:none;border:none;border-radius:3px;padding:0 4px;font-size:20px;line-height:1;color:inherit;cursor:pointer}
-      #adb-details .adb-tools button:hover{opacity:0.7}
       #adb-list{margin:0;line-height:17px;tab-size:4;color:inherit;font:14px/18px Consolas, monospace;max-height:360px;overflow:auto;flex:1 1 auto}
       #adb-webhook-list{margin:0;line-height:17px;tab-size:4;color:inherit;font:14px/18px Consolas, monospace;max-height:360px;overflow:auto;flex:1 1 auto}
       #adb-webhook-list .adb-empty{opacity:0.7;padding:6px 2px}
@@ -10301,6 +11922,31 @@ function buildPanel() {
         100%{transform:translateX(var(--adb-marquee-distance, -40%))}
       }
       .adb-time{flex:0 0 6ch;width:6ch;text-align:right;margin-left:1ch;margin-right:1ch}
+      .adb-spend-flag{
+        margin-left:6px;
+        flex:0 0 auto;
+        width:14px;
+        height:14px;
+        display:inline-block;
+        background:url("${ICONS.money}") no-repeat center/contain;
+        filter:grayscale(0.2);
+      }
+      .adb-price-badge{
+        margin-left:6px;
+        flex:0 0 auto;
+        display:inline-flex;
+        align-items:center;
+        justify-content:center;
+        min-width:18px;
+        height:14px;
+        padding:0 4px;
+        border-radius:3px;
+        background:rgba(31,79,116,0.12);
+        color:#12395e;
+        font-size:11px;
+        font-weight:700;
+        line-height:1;
+      }
       .drawer-strip{height:20px;background:#f1f3f9;width:100%;display:block;margin:0;}
       .adb-tools{margin-left:auto;display:flex;gap:4px}
       .adb-tools button{background:none;border:none;cursor:pointer;font-size:20px;line-height:1;color:inherit;padding:0 2px;align-self:flex-start}
@@ -10567,6 +12213,7 @@ function buildPanel() {
       #settingsBtn.btn.active{background:rgba(31,79,116,0.08);border-color:transparent}
       .settings-row{display:flex;align-items:center;gap:8px;font-size:13px;cursor:pointer}
       .settings-row input{width:16px;height:16px;cursor:pointer}
+      .settings-row.is-disabled{opacity:0.55}
       .settings-select{width:100%;max-width:100%;box-sizing:border-box;padding:6px 8px;border:1px solid var(--ar-border, ${PANEL_BORDER});border-radius:3px;background:var(--ar-bg, ${PANEL_BG});font:inherit;color:inherit}
       .settings-search-row{display:flex;gap:8px;align-items:center;margin-top:6px}
       .settings-search-row .settings-select{flex:1 1 auto}
@@ -10672,6 +12319,14 @@ function buildPanel() {
               <input type="checkbox" id="lettersNewWindowToggle">
               <span>Открывать письма в новом окне</span>
             </label>
+            <label class="settings-row">
+              <input type="checkbox" id="wsEventsDisabledToggle">
+              <span>Вебхук События</span>
+            </label>
+            <label class="settings-row">
+              <input type="checkbox" id="webhooksPaidFilterToggle">
+              <span>Только платные события</span>
+            </label>
             <label class="settings-row" for="lettersOpenHotkeyInput">
               <span>Горячая клавиша открытия письма</span>
             </label>
@@ -10680,6 +12335,10 @@ function buildPanel() {
               <span>Горячая клавиша открытия профиля</span>
             </label>
             <input class="settings-select" id="profilePhotoHotkeyInput" type="text" placeholder="Горячая клавиша (например ctrl+p)">
+            <label class="settings-row" for="translateSendHotkeyInput">
+              <span>Горячая клавиша Перевести + Отправить</span>
+            </label>
+            <input class="settings-select" id="translateSendHotkeyInput" type="text" placeholder="Горячая клавиша (например ctrl+g)">
           </div>
         </div>
         <div class="row" id="row" style="display:none">
@@ -10779,8 +12438,11 @@ function buildPanel() {
     operatorWaitModal: shadow.getElementById("operatorWaitModal"),
     operatorWaitModalOk: shadow.getElementById("operatorWaitModalOk"),
     lettersNewWindowToggle: shadow.getElementById("lettersNewWindowToggle"),
+    wsEventsDisabledToggle: shadow.getElementById("wsEventsDisabledToggle"),
+    webhooksPaidFilterToggle: shadow.getElementById("webhooksPaidFilterToggle"),
     lettersOpenHotkeyInput: shadow.getElementById("lettersOpenHotkeyInput"),
     profilePhotoHotkeyInput: shadow.getElementById("profilePhotoHotkeyInput"),
+    translateSendHotkeyInput: shadow.getElementById("translateSendHotkeyInput"),
     profileSwitch: null,
     pin: shadow.getElementById("pin"),
     close: shadow.getElementById("close"),
@@ -10794,8 +12456,13 @@ function buildPanel() {
     if (balanceMonitor?.element && ui.balanceHost) {
       ui.balanceHost.appendChild(balanceMonitor.element);
       ui.balanceMonitor = balanceMonitor;
+      setWsEventsDisabledSetting(getWsEventsDisabledSetting(), { persist: false });
       syncBalancePanelLayout();
-      if (wsEventQueue.length && typeof balanceMonitor.addWsEvent === "function") {
+      if (
+        !wsEventsDisabled &&
+        wsEventQueue.length &&
+        typeof balanceMonitor.addWsEvent === "function"
+      ) {
         const queued = wsEventQueue.slice();
         wsEventQueue = [];
         queued.forEach((item) => {
@@ -10803,6 +12470,9 @@ function buildPanel() {
             balanceMonitor.addWsEvent(item);
           } catch {}
         });
+      }
+      if (wsEventsDisabled) {
+        wsEventQueue = [];
       }
     }
   } catch (err) {
@@ -11737,8 +13407,13 @@ const MEDIA_DELETE_BUTTON_CLASS = "ot4et-media-delete-btn";
 const MEDIA_DELETE_STYLE_ID = "ot4et-media-delete-style";
 const MEDIA_DELETE_MODAL_ID = "ot4et-media-delete-modal";
 const MEDIA_CHAT_STORAGE_KEY = "OT4ET_MEDIA_CHATIDS";
+const MEDIA_PIN_STORAGE_KEY = "OT4ET_MEDIA_PINNED_IDS";
+const MEDIA_PIN_BUTTON_ATTR = "data-ot4et-media-pin-btn";
+const MEDIA_PINNED_ATTR = "data-ot4et-pinned";
 const mediaChatIdMap = new Map();
 let mediaChatMapLoaded = false;
+const mediaPinnedIds = new Set();
+let mediaPinnedLoaded = false;
 
 function normalizeMediaLink(link) {
   return String(link || "").trim();
@@ -11800,9 +13475,74 @@ function ensureMediaDeleteStyles(doc) {
   /* layout handled by attach_new_popup_folder_btn */
   color:#eb5757;
 }
+.ot4et-media-pin-btn{
+  display:inline-flex;
+  align-items:center;
+  justify-content:center;
+  margin-left:8px;
+  flex:0 0 auto;
+  width:20px;
+  height:20px;
+  cursor:pointer;
+  opacity:.72;
+  transition:opacity .12s ease, transform .12s ease;
+}
+.ot4et-media-pin-btn:hover{
+  opacity:1;
+}
+.ot4et-media-pin-btn[data-pinned="1"]{
+  opacity:1;
+  transform:translateY(-1px);
+}
+.upload_popup_tabs_content_item[${MEDIA_PINNED_ATTR}="1"]{
+  outline:1px solid rgba(31,79,116,.28);
+  outline-offset:-1px;
+}
 `;
     (doc.head || doc.documentElement || doc.body)?.appendChild(style);
   } catch {}
+}
+
+function loadMediaPinnedIds() {
+  if (mediaPinnedLoaded) return;
+  mediaPinnedLoaded = true;
+  try {
+    const raw = window.localStorage?.getItem?.(MEDIA_PIN_STORAGE_KEY);
+    if (!raw) return;
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return;
+    parsed.forEach((id) => {
+      const normalized = String(id || "").trim();
+      if (normalized) mediaPinnedIds.add(normalized);
+    });
+  } catch {}
+}
+
+function persistMediaPinnedIds() {
+  try {
+    const payload = Array.from(mediaPinnedIds.values());
+    window.localStorage?.setItem?.(MEDIA_PIN_STORAGE_KEY, JSON.stringify(payload));
+  } catch {}
+}
+
+function getMediaItemId(item) {
+  return String(item?.dataset?.id || item?.getAttribute?.("data-id") || "").trim();
+}
+
+function isMediaItemPinnedById(id) {
+  loadMediaPinnedIds();
+  const normalized = String(id || "").trim();
+  if (!normalized) return false;
+  return mediaPinnedIds.has(normalized);
+}
+
+function setMediaItemPinned(item, pinned) {
+  const id = getMediaItemId(item);
+  if (!id) return;
+  loadMediaPinnedIds();
+  if (pinned) mediaPinnedIds.add(id);
+  else mediaPinnedIds.delete(id);
+  persistMediaPinnedIds();
 }
 
 function getMediaUserId() {
@@ -11974,11 +13714,16 @@ async function deleteSelectedMedia(doc) {
       if (!res?.ok) {
         throw new Error(`deleteMedia HTTP ${res?.status}`);
       }
+      if (entry?.id) {
+        loadMediaPinnedIds();
+        mediaPinnedIds.delete(String(entry.id));
+      }
       entry.item?.remove?.();
     } catch (err) {
       if (!isExtCtxInvalid(err)) LOG.warn("deleteSelectedMedia error", err);
     }
   }
+  persistMediaPinnedIds();
   updateMediaDeleteButtonState(doc);
 }
 
@@ -12140,6 +13885,86 @@ function removeMediaIcon(bottom) {
   }
 }
 
+function ensureMediaPinIcon(doc, item, bottom) {
+  if (!doc || !item || !bottom) return;
+  const id = getMediaItemId(item);
+  if (!id) return;
+  let host = bottom.querySelector(`[${MEDIA_PIN_BUTTON_ATTR}]`);
+  if (!host) {
+    host = doc.createElement("div");
+    host.setAttribute(MEDIA_PIN_BUTTON_ATTR, "1");
+    host.className = "ot4et-media-pin-btn";
+    host.addEventListener("click", (event) => {
+      try {
+        event.preventDefault();
+        event.stopPropagation();
+      } catch {}
+      const currentPinned = host?.dataset?.pinned === "1";
+      const nextPinned = !currentPinned;
+      setMediaItemPinned(item, nextPinned);
+      syncMediaBottomIcons();
+    });
+    const img = doc.createElement("img");
+    img.decoding = "async";
+    img.loading = "lazy";
+    img.alt = "";
+    img.width = 16;
+    img.height = 16;
+    img.setAttribute("aria-hidden", "true");
+    img.style.display = "block";
+    host.appendChild(img);
+  }
+  const pinned = isMediaItemPinnedById(id);
+  host.dataset.pinned = pinned ? "1" : "0";
+  host.title = pinned ? "Открепить" : "Закрепить в начале";
+  host.setAttribute("aria-label", host.title);
+  const img = host.querySelector("img");
+  if (img) {
+    img.src = pinned ? ICONS.pinActive : ICONS.pin;
+  }
+  item.setAttribute(MEDIA_PINNED_ATTR, pinned ? "1" : "0");
+  const trash = bottom.querySelector(".popup_trash");
+  if (trash && host !== trash.previousElementSibling) {
+    bottom.insertBefore(host, trash);
+  } else if (!trash && !host.parentElement) {
+    bottom.appendChild(host);
+  } else if (!host.parentElement) {
+    bottom.appendChild(host);
+  }
+}
+
+function ensureMediaPinnedOrder(doc) {
+  if (!doc) return;
+  const container =
+    doc.querySelector?.('[data-testid="file-list"]') ||
+    doc.querySelector?.("#uptcmp") ||
+    doc.querySelector?.(".upload_popup_tabs_content_middle.photo");
+  if (!container) return;
+  const items = Array.from(
+    container.querySelectorAll?.(".upload_popup_tabs_content_item") || []
+  );
+  if (!items.length) return;
+  const pinned = [];
+  const regular = [];
+  for (const item of items) {
+    const id = getMediaItemId(item);
+    if (id && isMediaItemPinnedById(id)) pinned.push(item);
+    else regular.push(item);
+  }
+  const nextOrder = [...pinned, ...regular];
+  let alreadyOrdered = true;
+  for (let index = 0; index < items.length; index += 1) {
+    if (items[index] !== nextOrder[index]) {
+      alreadyOrdered = false;
+      break;
+    }
+  }
+  if (alreadyOrdered) return;
+  const frag = doc.createDocumentFragment();
+  nextOrder.forEach((node) => frag.appendChild(node));
+  container.appendChild(frag);
+}
+
 function syncMediaBottomIcons() {
   try {
     const iconSentUrl = ICONS.sent;
@@ -12153,6 +13978,7 @@ function syncMediaBottomIcons() {
       if (!bottoms?.length) continue;
       for (const bottom of bottoms) {
         const item = bottom?.closest?.(".upload_popup_tabs_content_item");
+        if (item) ensureMediaPinIcon(doc, item, bottom);
         const linkRaw = extractMediaItemLink(item);
         const normalizedLink = normalizeMediaLink(linkRaw);
         if (!normalizedLink || !mediaSentLinks.has(normalizedLink)) {
@@ -12186,6 +14012,7 @@ function syncMediaBottomIcons() {
           removeMediaIcon(bottom);
         }
       }
+      ensureMediaPinnedOrder(doc);
     }
   } catch (e) {
     if (!isExtCtxInvalid(e)) LOG.warn("syncMediaBottomIcons error", e);
@@ -13718,6 +15545,7 @@ const obs = new MutationObserver(() => {
   if (IS_SVG_DOCUMENT) return;
   applyModalState(getModalState(), { source: "mutation" });
   syncMediaBottomIcons();
+  scheduleProfilesViewportLayout();
   ensureConnectManInfoButtons();
   if (!ui?.drawer?.classList?.contains("open")) return;
   scheduleContextRefresh();
@@ -13745,6 +15573,7 @@ window.addEventListener("unload", () => {
       clearInterval(modalPollTimer);
       modalPollTimer = null;
     }
+    clearOperatorRatingHourlyRefresh();
     clearMonitorHourlyRefresh();
   } catch {}
 });
@@ -13757,11 +15586,13 @@ window.addEventListener("unload", () => {
     document.addEventListener("click", handleLettersNavClick, true);
     document.addEventListener("keydown", handleLettersBindHotkey, true);
     document.addEventListener("keydown", handleProfilePhotoBindHotkey, true);
+    document.addEventListener("keydown", handleTranslateSendBindHotkey, true);
   } catch {}
   await loadExtensionLockState();
   buildPanel();
   setOperatorIdAvailability(hasValidOperatorId(), "init");
   syncMediaBottomIcons();
+  scheduleProfilesViewportLayout();
   ensureConnectManInfoButtons();
   applyModalState(getModalState(), { source: "init" });
   const {
@@ -13775,6 +15606,7 @@ window.addEventListener("unload", () => {
     [LETTERS_NEW_WINDOW_STORAGE_KEY]: lettersNewWindowStored,
     [LETTERS_OPEN_HOTKEY_STORAGE_KEY]: lettersOpenHotkeyStored,
     [PROFILE_PHOTO_HOTKEY_STORAGE_KEY]: profilePhotoHotkeyStored,
+    [TRANSLATE_SEND_HOTKEY_STORAGE_KEY]: translateSendHotkeyStored,
   } = await getStore([
     "lang",
     "pinned",
@@ -13786,6 +15618,7 @@ window.addEventListener("unload", () => {
     LETTERS_NEW_WINDOW_STORAGE_KEY,
     LETTERS_OPEN_HOTKEY_STORAGE_KEY,
     PROFILE_PHOTO_HOTKEY_STORAGE_KEY,
+    TRANSLATE_SEND_HOTKEY_STORAGE_KEY,
   ]);
   currentLang = lang || "ru";
   pinned = !!p;
@@ -13794,6 +15627,7 @@ window.addEventListener("unload", () => {
   }
   setLettersOpenHotkey(lettersOpenHotkeyStored, { persist: false });
   setProfilePhotoHotkey(profilePhotoHotkeyStored, { persist: false });
+  setTranslateSendHotkey(translateSendHotkeyStored, { persist: false });
   historyItems = Array.isArray(hist) ? hist : [];
   if (storedTaHeight) applyTextareaHeight(storedTaHeight);
   // Если день сменился с прошлого запуска — начинаем с пустого поля (без автозагрузки)
@@ -13820,6 +15654,7 @@ window.addEventListener("unload", () => {
   }
   updateLauncherVisibility();
   startLocalTimeUpdates();
+  consumeQueuedChatHistorySpendEvents();
   ensureProfileInfoButtons();
   await loadServerAuthState();
   try {
@@ -13888,6 +15723,24 @@ window.addEventListener("unload", () => {
       setLettersNewWindowEnabled(checked);
     });
   }
+  if (ui?.wsEventsDisabledToggle) {
+    setWsEventsDisabledSetting(getWsEventsDisabledSetting(), { persist: false });
+    ui.wsEventsDisabledToggle.addEventListener("change", (event) => {
+      const checked = !!event?.target?.checked;
+      setWsEventsDisabledSetting(!checked, { persist: true });
+    });
+  } else {
+    setWebhooksPaidFilterControlDisabled(wsEventsDisabled);
+  }
+  if (ui?.webhooksPaidFilterToggle) {
+    setWebhooksPaidEventsFilterEnabled(getWebhooksPaidEventsFilterEnabled(), {
+      persist: false,
+    });
+    ui.webhooksPaidFilterToggle.addEventListener("change", (event) => {
+      const checked = !!event?.target?.checked;
+      setWebhooksPaidEventsFilterEnabled(checked, { persist: true });
+    });
+  }
   if (ui?.lettersOpenHotkeyInput) {
     setLettersOpenHotkey(lettersOpenHotkey, { persist: false });
     ui.lettersOpenHotkeyInput.addEventListener("change", (event) => {
@@ -13904,6 +15757,15 @@ window.addEventListener("unload", () => {
     });
     ui.profilePhotoHotkeyInput.addEventListener("blur", (event) => {
       setProfilePhotoHotkey(event?.target?.value);
+    });
+  }
+  if (ui?.translateSendHotkeyInput) {
+    setTranslateSendHotkey(translateSendHotkey, { persist: false });
+    ui.translateSendHotkeyInput.addEventListener("change", (event) => {
+      setTranslateSendHotkey(event?.target?.value);
+    });
+    ui.translateSendHotkeyInput.addEventListener("blur", (event) => {
+      setTranslateSendHotkey(event?.target?.value);
     });
   }
   if (ui?.settingsBtn) {
@@ -13987,6 +15849,7 @@ try {
       prefetchMediaChatContext();
       updateWomanLocalTimeInHeader();
       updateManLocalTimeInHeader();
+      updateManSpendInHeader();
       ensureProfileInfoButtons();
     } catch {}
   };

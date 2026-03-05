@@ -709,6 +709,18 @@ function setupContextMenu() {
         title: "ОТ4ЕТ: Удалить выделенное",
         contexts: ["selection"],
       });
+      chrome.contextMenus.create({
+        id: "ot4et-replace-image",
+        title: "ОТ4ЕТ: Заменить фото",
+        contexts: ["image"],
+        documentUrlPatterns: ["https://alpha.date/*"],
+      });
+      chrome.contextMenus.create({
+        id: "ot4et-normalize-message-time",
+        title: "ОТ4ЕТ: Нормализировать время",
+        contexts: ["page"],
+        documentUrlPatterns: ["https://alpha.date/*"],
+      });
     });
   } catch {}
 }
@@ -721,13 +733,356 @@ chrome.contextMenus.onClicked.addListener((info, tab) => {
     if (!tab?.id) return;
     if (
       action !== "ot4et-censor-selected-text" &&
-      action !== "ot4et-delete-selected-text"
+      action !== "ot4et-delete-selected-text" &&
+      action !== "ot4et-replace-image" &&
+      action !== "ot4et-normalize-message-time"
     ) {
       return;
     }
     chrome.scripting.executeScript({
       target: { tabId: tab.id },
-      func: (actionType) => {
+      func: async (actionType, oldSrc, newSrc) => {
+        if (actionType === "ot4et-normalize-message-time") {
+          const root = document.documentElement;
+          const FLAG_KEY = "ot4etMessageDateNormalized";
+          const DATE_SEL = '[data-testid="message-date"]';
+          const nodes = Array.from(document.querySelectorAll(DATE_SEL));
+          if (!nodes.length) return;
+
+          const pad2 = (n) => String(Math.max(0, Number(n) || 0)).padStart(2, "0");
+          const floorDay = (d) =>
+            new Date(d.getFullYear(), d.getMonth(), d.getDate(), 0, 0, 0, 0);
+          const formatNormalizedDateTime = (date, todayDayMs) => {
+            if (!date || Number.isNaN(date.getTime())) return "";
+            const hhmm = `${pad2(date.getHours())}:${pad2(date.getMinutes())}`;
+            const sameDay =
+              Number.isFinite(Number(todayDayMs)) &&
+              floorDay(date).getTime() === Number(todayDayMs);
+            return sameDay
+              ? hhmm
+              : `${pad2(date.getDate())}/${pad2(date.getMonth() + 1)} ${hhmm}`;
+          };
+          const normalizeHourOffset = (deltaHours) => {
+            let value = Number(deltaHours) || 0;
+            while (value > 12) value -= 24;
+            while (value < -12) value += 24;
+            return value;
+          };
+          const buildNearestDate = (dd, mo, hh, mm, aroundDate = new Date()) => {
+            const ref = aroundDate instanceof Date ? aroundDate : new Date();
+            const years = [ref.getFullYear() - 1, ref.getFullYear(), ref.getFullYear() + 1];
+            let best = null;
+            for (const y of years) {
+              const candidate = new Date(
+                y,
+                Number(mo) - 1,
+                Number(dd),
+                Number(hh),
+                Number(mm),
+                0,
+                0
+              );
+              if (Number.isNaN(candidate.getTime())) continue;
+              if (
+                !best ||
+                Math.abs(candidate.getTime() - ref.getTime()) <
+                  Math.abs(best.getTime() - ref.getTime())
+              ) {
+                best = candidate;
+              }
+            }
+            return best;
+          };
+          const getChatUidFromLocation = () => {
+            try {
+              const path = String(window.location.pathname || "");
+              const match = path.match(/^\/(?:chat|letter)\/([^/?#]+)/i);
+              return match && match[1] ? decodeURIComponent(match[1]) : "";
+            } catch {
+              return "";
+            }
+          };
+          const parseWomanLocaltimeLabel = (raw) => {
+            const text = String(raw || "").trim();
+            const m = text.match(/(\d{2}):(\d{2})\s*\((\d{2})\/(\d{2})\)/);
+            if (!m) return null;
+            const hh = Number(m[1]);
+            const mm = Number(m[2]);
+            const dd = Number(m[3]);
+            const mo = Number(m[4]);
+            if (
+              !Number.isFinite(hh) ||
+              !Number.isFinite(mm) ||
+              !Number.isFinite(dd) ||
+              !Number.isFinite(mo)
+            ) {
+              return null;
+            }
+            return { hh, mm, dd, mo };
+          };
+          const parseMessageDateText = (raw) => {
+            const text = String(raw || "").trim();
+            if (!text) return null;
+            const parseHourMinuteWithAmPm = (hhRaw, mmRaw, apRaw) => {
+              let hh = Number(hhRaw);
+              const mm = Number(mmRaw);
+              if (!Number.isFinite(hh) || !Number.isFinite(mm)) return null;
+              const ap = String(apRaw || "").toLowerCase();
+              if (ap) {
+                hh = hh % 12;
+                if (ap === "p") hh += 12;
+              }
+              return { hh, mm };
+            };
+            let m = text.match(/^(\d{2}):(\d{2})$/);
+            if (m) return { kind: "time24", hh: Number(m[1]), mm: Number(m[2]) };
+            m = text.match(/^(\d{1,2}):(\d{2})\s*([ap])(?:\.?m\.?)$/i);
+            if (m) {
+              const parsedTime = parseHourMinuteWithAmPm(m[1], m[2], m[3]);
+              if (!parsedTime) return null;
+              return { kind: "time12", hh: parsedTime.hh, mm: parsedTime.mm };
+            }
+            m = text.match(/^(\d{2})\/(\d{2})\s+(\d{2}):(\d{2})$/);
+            if (m) {
+              return {
+                kind: "ddmm_slash",
+                dd: Number(m[1]),
+                mo: Number(m[2]),
+                hh: Number(m[3]),
+                mm: Number(m[4]),
+              };
+            }
+            m = text.match(/^(\d{2})\.(\d{2})\s+(\d{2}):(\d{2})$/);
+            if (m) {
+              return {
+                kind: "ddmm_dot",
+                dd: Number(m[1]),
+                mo: Number(m[2]),
+                hh: Number(m[3]),
+                mm: Number(m[4]),
+              };
+            }
+            m = text.match(
+              /^(\d{2})\/(\d{2})\s*\((\d{1,2}):(\d{2})(?:\s*([ap])(?:\.?m\.?))?\)$/i
+            );
+            if (m) {
+              const parsedTime = parseHourMinuteWithAmPm(m[3], m[4], m[5]);
+              if (!parsedTime) return null;
+              return {
+                kind: "ddmm_slash",
+                dd: Number(m[1]),
+                mo: Number(m[2]),
+                hh: parsedTime.hh,
+                mm: parsedTime.mm,
+              };
+            }
+            m = text.match(
+              /^(\d{2})\.(\d{2})\s*\((\d{1,2}):(\d{2})(?:\s*([ap])(?:\.?m\.?))?\)$/i
+            );
+            if (m) {
+              const parsedTime = parseHourMinuteWithAmPm(m[3], m[4], m[5]);
+              if (!parsedTime) return null;
+              return {
+                kind: "ddmm_dot",
+                dd: Number(m[1]),
+                mo: Number(m[2]),
+                hh: parsedTime.hh,
+                mm: parsedTime.mm,
+              };
+            }
+            m = text.match(
+              /^(\d{2})\/(\d{2})\s+(\d{1,2}):(\d{2})(?:\s*([ap])(?:\.?m\.?))?$/i
+            );
+            if (m) {
+              const parsedTime = parseHourMinuteWithAmPm(m[3], m[4], m[5]);
+              if (!parsedTime) return null;
+              return {
+                kind: "ddmm_slash",
+                dd: Number(m[1]),
+                mo: Number(m[2]),
+                hh: parsedTime.hh,
+                mm: parsedTime.mm,
+              };
+            }
+            m = text.match(
+              /^(\d{2})\.(\d{2})\s+(\d{1,2}):(\d{2})(?:\s*([ap])(?:\.?m\.?))?$/i
+            );
+            if (m) {
+              const parsedTime = parseHourMinuteWithAmPm(m[3], m[4], m[5]);
+              if (!parsedTime) return null;
+              return {
+                kind: "ddmm_dot",
+                dd: Number(m[1]),
+                mo: Number(m[2]),
+                hh: parsedTime.hh,
+                mm: parsedTime.mm,
+              };
+            }
+            m = text.match(
+              /^(today|today,|сегодня|сегодня,)\s+(\d{1,2}):(\d{2})(?:\s*([ap])(?:\.?m\.?))?$/i
+            );
+            if (m) {
+              const parsedTime = parseHourMinuteWithAmPm(m[2], m[3], m[4]);
+              if (!parsedTime) return null;
+              return { kind: "word_day", hh: parsedTime.hh, mm: parsedTime.mm, dayOffset: 0 };
+            }
+            m = text.match(
+              /^(yesterday|yesterday,|вчера|вчера,)\s+(\d{1,2}):(\d{2})(?:\s*([ap])(?:\.?m\.?))?$/i
+            );
+            if (m) {
+              const parsedTime = parseHourMinuteWithAmPm(m[2], m[3], m[4]);
+              if (!parsedTime) return null;
+              return { kind: "word_day", hh: parsedTime.hh, mm: parsedTime.mm, dayOffset: -1 };
+            }
+            return null;
+          };
+          const resolveDateFromParts = (parsed, womanDate) => {
+            if (!parsed) return null;
+            if (parsed.kind === "ddmm_slash" || parsed.kind === "ddmm_dot") {
+              return buildNearestDate(parsed.dd, parsed.mo, parsed.hh, parsed.mm, womanDate);
+            }
+            if (parsed.kind === "word_day" && Number.isFinite(parsed.dayOffset)) {
+              const base = new Date(
+                womanDate.getFullYear(),
+                womanDate.getMonth(),
+                womanDate.getDate(),
+                parsed.hh,
+                parsed.mm,
+                0,
+                0
+              );
+              base.setDate(base.getDate() + parsed.dayOffset);
+              return base;
+            }
+            return new Date(
+              womanDate.getFullYear(),
+              womanDate.getMonth(),
+              womanDate.getDate(),
+              parsed.hh,
+              parsed.mm,
+              0,
+              0
+            );
+          };
+          const fetchChatHistoryDates = async (chatUid) => {
+            const normalizedChatUid = String(chatUid || "").trim();
+            if (!normalizedChatUid) return [];
+            try {
+              const token = String(window?.localStorage?.getItem?.("token") || "").trim();
+              const headers = {
+                accept: "application/json, text/plain, */*",
+                "content-type": "application/json",
+              };
+              if (token) headers.authorization = `Bearer ${token}`;
+              const response = await fetch("https://alpha.date/api/chatList/chatHistory", {
+                method: "POST",
+                credentials: "include",
+                headers,
+                body: JSON.stringify({ chat_id: normalizedChatUid, page: 1 }),
+              });
+              if (!response.ok) return [];
+              const payload = await response.json().catch(() => null);
+              const list = Array.isArray(payload?.response) ? payload.response : [];
+              return list
+                .map((row) => {
+                  const iso = String(row?.date_created || row?.created_at || "").trim();
+                  if (!iso) return null;
+                  const parsed = new Date(iso);
+                  return Number.isNaN(parsed.getTime()) ? null : parsed;
+                })
+                .filter(Boolean);
+            } catch {
+              return [];
+            }
+          };
+
+          if (root?.dataset?.[FLAG_KEY] === "1") {
+            let restored = 0;
+            nodes.forEach((el) => {
+              const original = el?.dataset?.ot4etOriginalDate;
+              if (typeof original === "string" && original.length) {
+                el.textContent = original;
+                restored += 1;
+              }
+            });
+            try {
+              delete root.dataset[FLAG_KEY];
+            } catch {
+              root.dataset[FLAG_KEY] = "";
+            }
+            if (restored > 0) {
+              return;
+            }
+            // Если флаг остался от старого DOM, но оригиналов уже нет,
+            // сразу выполняем нормализацию в этот же клик.
+          }
+
+          const womanLabel = document.querySelector(".ot4et-woman-localtime");
+          const womanTime = parseWomanLocaltimeLabel(womanLabel?.textContent || "");
+          if (!womanTime) return;
+          const now = new Date();
+          const womanDate = buildNearestDate(
+            womanTime.dd,
+            womanTime.mo,
+            womanTime.hh,
+            womanTime.mm,
+            now
+          );
+          if (!womanDate) return;
+          const chatUid = getChatUidFromLocation();
+          const historyDates = await fetchChatHistoryDates(chatUid);
+          const parsedNodes = [];
+          nodes.forEach((el) => {
+            const currentText = String(el?.textContent || "").trim();
+            if (!currentText) return;
+            const source = el.dataset.ot4etOriginalDate || currentText;
+            const parsed = parseMessageDateText(source);
+            if (!parsed) return;
+            parsedNodes.push({ el, currentText, parsed });
+          });
+          if (!parsedNodes.length) return;
+          const localHour = now.getHours();
+          const hourOffset = normalizeHourOffset(womanTime.hh - localHour);
+          const womanDay = floorDay(womanDate).getTime();
+          let changed = false;
+          parsedNodes.forEach(({ el, currentText, parsed }, index) => {
+            if (!el.dataset.ot4etOriginalDate) {
+              el.dataset.ot4etOriginalDate = currentText;
+            }
+            const reverseIndex = parsedNodes.length - 1 - index;
+            const historyDate =
+              reverseIndex >= 0 && reverseIndex < historyDates.length
+                ? historyDates[historyDates.length - 1 - reverseIndex]
+                : null;
+            const baseDate =
+              historyDate && !Number.isNaN(historyDate.getTime())
+                ? new Date(historyDate.getTime())
+                : resolveDateFromParts(parsed, womanDate);
+            if (!baseDate || Number.isNaN(baseDate.getTime())) return;
+            const shifted = new Date(baseDate.getTime());
+            shifted.setHours(shifted.getHours() + hourOffset);
+            const formatted = formatNormalizedDateTime(shifted, womanDay);
+            if (!formatted) return;
+            el.textContent = formatted;
+            changed = true;
+          });
+          if (changed) {
+            root.dataset[FLAG_KEY] = "1";
+          }
+          return;
+        }
+        if (actionType === "ot4et-replace-image") {
+          if (!oldSrc || !newSrc) return;
+          const images = document.getElementsByTagName("img");
+          for (const img of images) {
+            if (img && img.src === oldSrc) {
+              img.src = newSrc;
+              img.srcset = "";
+              img.style.objectFit = "cover";
+            }
+          }
+          return;
+        }
         const selection = window.getSelection();
         if (!selection || !selection.rangeCount || selection.isCollapsed) return;
         const range = selection.getRangeAt(0);
@@ -739,7 +1094,7 @@ chrome.contextMenus.onClicked.addListener((info, tab) => {
           range.deleteContents();
         }
       },
-      args: [action],
+      args: [action, info?.srcUrl || "", chrome.runtime.getURL("icons/placeholder.png")],
     });
   } catch {}
 });
