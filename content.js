@@ -349,6 +349,9 @@ const CONFIG_TYPE_CHECK_ENDPOINT = "https://alpha.date/api/config/type/check";
 const CONFIG_TYPE_CACHE_TTL_MS = 60 * 1000;
 const CHAT_HISTORY_ENDPOINT = "https://alpha.date/api/chatList/chatHistory";
 const WS_CHAT_HISTORY_SPEND_CACHE_TTL_MS = 60 * 1000;
+const CHAT_SPEND_UPSERT_ENDPOINT = "/chat/spend/upsert";
+const CHAT_SPEND_GET_ENDPOINT = "/chat/spend/max";
+const CHAT_SPEND_SERVER_SYNC_TTL_MS = 60 * 1000;
 const OPERATOR_RATING_ENDPOINT = "/operators/rating";
 const OPERATOR_RATING_LIMIT = 50;
 const OPERATOR_RATING_CACHE_TTL_MS = 5 * 60 * 1000;
@@ -392,6 +395,8 @@ const wsChatHistorySpendInFlight = new Map();
 const manSpendByChatUid = new Map();
 const manSpendByChatId = new Map();
 const manSpendByPairKey = new Map();
+const chatSpendServerSyncCache = new Map();
+const chatSpendServerInFlight = new Map();
 const headerChatHistorySpendInFlight = new Map();
 const HEADER_CHAT_HISTORY_SPEND_REFRESH_TTL_MS = 60 * 1000;
 let activeChatUidCache = "";
@@ -466,6 +471,109 @@ function getManSpendPairKey(manExternalId, womanExternalId) {
   return `${man}::${woman}`;
 }
 
+function getChatSpendSyncOperatorMeta() {
+  try {
+    const operatorId = String(operatorInfoState?.operatorId || "").trim();
+    const operatorName = String(operatorInfoState?.operatorName || "").trim();
+    return {
+      operator_id: operatorId || "",
+      operator_name: operatorName || "",
+    };
+  } catch {
+    return {
+      operator_id: "",
+      operator_name: "",
+    };
+  }
+}
+
+async function syncChatSpendMaxToServer(entry) {
+  try {
+    if (!entry || typeof entry !== "object") return false;
+    const maleId = normalizeExternalId(entry.man_external_id);
+    const femaleId = normalizeExternalId(entry.woman_external_id);
+    const maxSpend = Number(entry.max_spend_all_credits);
+    if (!maleId || !femaleId || !Number.isFinite(maxSpend) || maxSpend <= 0) {
+      return false;
+    }
+    const pairKey = getManSpendPairKey(maleId, femaleId);
+    if (!pairKey) return false;
+    const now = Date.now();
+    const cached = chatSpendServerSyncCache.get(pairKey);
+    if (
+      cached &&
+      Number(cached.ts) + CHAT_SPEND_SERVER_SYNC_TTL_MS > now &&
+      Number(cached.max) >= maxSpend
+    ) {
+      return true;
+    }
+    const inFlight = chatSpendServerInFlight.get(pairKey);
+    if (inFlight) {
+      try {
+        const inFlightMax = Number(inFlight.max);
+        if (Number.isFinite(inFlightMax) && inFlightMax >= maxSpend) {
+          return await inFlight.promise;
+        }
+      } catch {}
+    }
+    const requestPromise = (async () => {
+      const base = await getProfileStatsApiBase();
+      if (!base) return false;
+      const store = await getStore(["apiKey"]).catch(() => ({}));
+      const effectiveKey =
+        (store?.apiKey && String(store.apiKey).trim()) || DEFAULT_API_KEY;
+      const headers = { "Content-Type": "application/json" };
+      if (effectiveKey) {
+        headers.Authorization = `Bearer ${effectiveKey}`;
+      }
+      const { operator_id, operator_name } = getChatSpendSyncOperatorMeta();
+      const payload = {
+        male_id: maleId,
+        female_id: femaleId,
+        max_spend_all_credits: maxSpend,
+        chat_uid: String(entry.chat_uid || "").trim() || "",
+        operator_id,
+        operator_name,
+        updated_at: Number(entry.updated_at || Date.now()) || Date.now(),
+      };
+      const res = await fetch(`${base}${CHAT_SPEND_UPSERT_ENDPOINT}`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(payload),
+      });
+      if (!res.ok) return false;
+      const data = await res.json().catch(() => ({}));
+      if (!data || data.ok !== true) return false;
+      const storedMax = Number(
+        data.stored_max_spend_all_credits ?? data.max_spend_all_credits
+      );
+      const acceptedMax =
+        Number.isFinite(storedMax) && storedMax >= 0
+          ? storedMax
+          : maxSpend;
+      chatSpendServerSyncCache.set(pairKey, {
+        max: acceptedMax,
+        ts: Date.now(),
+      });
+      return true;
+    })();
+    chatSpendServerInFlight.set(pairKey, {
+      promise: requestPromise,
+      max: maxSpend,
+    });
+    try {
+      return await requestPromise;
+    } finally {
+      const latest = chatSpendServerInFlight.get(pairKey);
+      if (latest && latest.promise === requestPromise) {
+        chatSpendServerInFlight.delete(pairKey);
+      }
+    }
+  } catch {
+    return false;
+  }
+}
+
 function upsertManSpendEntry(entry) {
   if (!entry || typeof entry !== "object") return;
   const updatedAt = Number(entry.updated_at || 0) || Date.now();
@@ -502,6 +610,9 @@ function upsertManSpendEntry(entry) {
     if (!prev || Number(prev.updated_at || 0) <= updatedAt) {
       manSpendByPairKey.set(pairKey, normalized);
     }
+  }
+  if (manExternalId && womanExternalId && maxSpend > 0) {
+    void syncChatSpendMaxToServer(normalized);
   }
 }
 
@@ -4452,14 +4563,35 @@ async function ensureManSpendDataForActiveChat() {
     const maxSpend = extractMaxSpendAllCreditsFromChatHistory(payload);
     const list = Array.isArray(payload?.response) ? payload.response : [];
     const firstRow = list.find((row) => row && typeof row === "object") || null;
-    let manExternalId = normalizeExternalId(firstRow?.sender_external_id);
-    let womanExternalId = normalizeExternalId(firstRow?.recipient_external_id);
+    const maleRow =
+      list.find(
+        (row) =>
+          row &&
+          typeof row === "object" &&
+          Number(row?.is_male) === 1 &&
+          normalizeExternalId(row?.sender_external_id) &&
+          normalizeExternalId(row?.recipient_external_id)
+      ) || null;
+    let manExternalId = normalizeExternalId(maleRow?.sender_external_id);
+    let womanExternalId = normalizeExternalId(maleRow?.recipient_external_id);
     if (!manExternalId || !womanExternalId) {
       try {
         const ctx = readContext();
         if (!manExternalId) manExternalId = normalizeExternalId(ctx?.man?.id);
         if (!womanExternalId) womanExternalId = normalizeExternalId(ctx?.woman?.id);
       } catch {}
+    }
+    if ((!manExternalId || !womanExternalId) && firstRow) {
+      const firstIsMale = Number(firstRow?.is_male) === 1;
+      if (firstIsMale) {
+        if (!manExternalId) manExternalId = normalizeExternalId(firstRow?.sender_external_id);
+        if (!womanExternalId)
+          womanExternalId = normalizeExternalId(firstRow?.recipient_external_id);
+      } else {
+        if (!manExternalId) manExternalId = normalizeExternalId(firstRow?.recipient_external_id);
+        if (!womanExternalId)
+          womanExternalId = normalizeExternalId(firstRow?.sender_external_id);
+      }
     }
     const chatId =
       String(firstRow?.chat_id || "").trim() || String(getActiveChatIdForSpend() || "").trim();
@@ -6611,9 +6743,26 @@ function applyProfilesViewportLayout() {
         resetStyles();
         return;
       }
+      const reservedHeight = (() => {
+        try {
+          let sum = 0;
+          const children = Array.from(block.children || []);
+          for (const child of children) {
+            if (!child || child === list) continue;
+            const childRect = child.getBoundingClientRect?.();
+            const childHeight = Math.max(0, Number(childRect?.height) || 0);
+            if (!childHeight) continue;
+            sum += childHeight;
+          }
+          return sum;
+        } catch {
+          return 0;
+        }
+      })();
+      const listMax = Math.max(120, Math.floor(available - reservedHeight - 8));
       block.style.maxHeight = `${available}px`;
       list.style.height = "auto";
-      list.style.maxHeight = `${Math.max(120, available - 54)}px`;
+      list.style.maxHeight = `${listMax}px`;
       list.style.overflowY = "auto";
       list.style.minHeight = "0";
     });
@@ -6682,18 +6831,24 @@ const CONNECT_MAN_INFO_BUTTON_CLASS = "ot4et-connect-man-info-btn";
 const CONNECT_MAN_INFO_CONTAINER_CLASS = "ot4et-connect-man-info-container";
 const CONNECT_MAN_TG_BUTTON_CLASS = "ot4et-connect-man-tg-btn";
 const CONNECT_MAN_TG_CONTAINER_CLASS = "ot4et-connect-man-tg-container";
+const CONNECT_MAN_SPEND_BUTTON_CLASS = "ot4et-connect-man-spend-btn";
+const CONNECT_MAN_SPEND_CONTAINER_CLASS = "ot4et-connect-man-spend-container";
 const CONNECT_PERSONAL_INVITES_LIST_ENDPOINT =
   "https://alpha.date/api/personal-invites/personal-invites-list";
 const CONNECT_MY_PROFILE_ENDPOINT = "https://alpha.date/api/operator/myProfile";
+const CHAT_SPEND_TOTAL_BY_MALE_ENDPOINT = "/chat/spend/total-by-male";
 const CONNECT_INVITES_CACHE_TTL_MS = 45 * 1000;
 const CONNECT_PROFILE_CACHE_TTL_MS = 4 * 60 * 1000;
 const CONNECT_TG_COUNT_CACHE_TTL_MS = 60 * 1000;
+const CONNECT_MAN_SPEND_TOTAL_CACHE_TTL_MS = 60 * 1000;
 let connectInvitesCache = { expiresAt: 0, data: null };
 let connectInvitesInFlight = null;
 const connectProfileCache = new Map();
 const connectProfileInFlight = new Map();
 const connectTgCountCache = new Map();
 const connectTgCountInFlight = new Map();
+const connectManSpendTotalCache = new Map();
+const connectManSpendTotalInFlight = new Map();
 
 function extractConnectInvitesList(payload) {
   if (Array.isArray(payload?.newList)) return payload.newList;
@@ -6929,6 +7084,89 @@ function setConnectTgButtonState(button, state, count = null, message = "") {
   button.title = "Проверить отчёты в Telegram";
 }
 
+function setConnectManSpendButtonState(button, state, total = null, message = "") {
+  if (!button) return;
+  const mode = String(state || "idle").trim();
+  if (mode === "loading") {
+    button.textContent = "💰 …";
+    button.disabled = true;
+    button.style.opacity = "0.6";
+    button.setAttribute("aria-busy", "true");
+    button.title = "Считаю сумму кредитов...";
+    return;
+  }
+  button.disabled = false;
+  button.style.opacity = "";
+  button.removeAttribute("aria-busy");
+  if (mode === "success") {
+    const rounded = Number.isFinite(Number(total)) ? Math.round(Number(total)) : 0;
+    button.textContent = `💰 ${rounded}`;
+    button.title = `Сумма кредитов мужчины: ${rounded}`;
+    return;
+  }
+  if (mode === "error") {
+    button.textContent = "💰 !";
+    button.title = String(message || "Не удалось получить сумму");
+    return;
+  }
+  button.textContent = "💰 —";
+  button.title = "Сумма кредитов мужчины (все женщины)";
+}
+
+async function fetchChatSpendTotalByMaleId(maleId) {
+  const normalizedMaleId = String(maleId || "").trim();
+  if (!/^\d{10}$/.test(normalizedMaleId)) return null;
+  const base = await getProfileStatsApiBase();
+  if (!base) return null;
+  const store = await getStore(["apiKey"]).catch(() => ({}));
+  const effectiveKey =
+    (store?.apiKey && String(store.apiKey).trim()) || DEFAULT_API_KEY;
+  const headers = { Accept: "application/json, text/plain, */*" };
+  if (effectiveKey) {
+    headers.Authorization = `Bearer ${effectiveKey}`;
+  }
+  const url = `${base}${CHAT_SPEND_TOTAL_BY_MALE_ENDPOINT}?male_id=${encodeURIComponent(
+    normalizedMaleId
+  )}`;
+  const res = await fetch(url, { method: "GET", headers });
+  if (!res.ok) return null;
+  const data = await res.json().catch(() => ({}));
+  if (!data || data.ok !== true) return null;
+  const total = Number(data.total_spend_all_credits);
+  if (!Number.isFinite(total) || total < 0) return null;
+  return total;
+}
+
+async function resolveConnectManSpendTotalByMaleId(maleId) {
+  const normalizedMaleId = String(maleId || "").trim();
+  if (!/^\d{10}$/.test(normalizedMaleId)) return null;
+  const now = Date.now();
+  const cached = connectManSpendTotalCache.get(normalizedMaleId);
+  if (cached && Number(cached.expiresAt) > now) {
+    return Number.isFinite(Number(cached.total)) ? Number(cached.total) : null;
+  }
+  if (connectManSpendTotalInFlight.has(normalizedMaleId)) {
+    return connectManSpendTotalInFlight.get(normalizedMaleId);
+  }
+  const promise = (async () => {
+    const total = await fetchChatSpendTotalByMaleId(normalizedMaleId);
+    if (Number.isFinite(Number(total)) && Number(total) >= 0) {
+      connectManSpendTotalCache.set(normalizedMaleId, {
+        total: Number(total),
+        expiresAt: Date.now() + CONNECT_MAN_SPEND_TOTAL_CACHE_TTL_MS,
+      });
+      return Number(total);
+    }
+    return null;
+  })();
+  connectManSpendTotalInFlight.set(normalizedMaleId, promise);
+  try {
+    return await promise;
+  } finally {
+    connectManSpendTotalInFlight.delete(normalizedMaleId);
+  }
+}
+
 async function fetchTgReportsCountByMaleId(maleId) {
   const normalizedMaleId = String(maleId || "").trim();
   if (!normalizedMaleId) return null;
@@ -7151,6 +7389,36 @@ async function handleConnectTgButtonClick(event) {
   }
 }
 
+async function handleConnectManSpendButtonClick(event) {
+  event.preventDefault();
+  event.stopPropagation();
+  const button = event.currentTarget;
+  if (!button || button.disabled) return;
+  const item = button.closest(CONNECT_CHOOSE_MAN_ITEM_SELECTOR);
+  setConnectManSpendButtonState(button, "loading");
+  try {
+    const resolved = await resolveConnectManExternalId({ itemEl: item });
+    const total = await resolveConnectManSpendTotalByMaleId(resolved.manExternalId);
+    if (!Number.isFinite(Number(total))) {
+      setConnectManSpendButtonState(
+        button,
+        "error",
+        null,
+        "Не удалось получить сумму"
+      );
+      return;
+    }
+    setConnectManSpendButtonState(button, "success", Number(total));
+  } catch (err) {
+    setConnectManSpendButtonState(
+      button,
+      "error",
+      null,
+      String(err?.message || "Не удалось получить сумму")
+    );
+  }
+}
+
 function createConnectManInfoButton() {
   const button = document.createElement("button");
   button.type = "button";
@@ -7199,6 +7467,31 @@ function createConnectManTgButton() {
   return button;
 }
 
+function createConnectManSpendButton() {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = CONNECT_MAN_SPEND_BUTTON_CLASS;
+  button.style.height = "28px";
+  button.style.minWidth = "68px";
+  button.style.padding = "0 8px";
+  button.style.margin = "0";
+  button.style.border = "1px solid rgba(31,79,116,0.28)";
+  button.style.borderRadius = "14px";
+  button.style.background = "rgba(255,255,255,0.96)";
+  button.style.cursor = "pointer";
+  button.style.display = "inline-flex";
+  button.style.alignItems = "center";
+  button.style.justifyContent = "center";
+  button.style.fontSize = "12px";
+  button.style.fontWeight = "700";
+  button.style.lineHeight = "1";
+  button.style.color = "#1f4f74";
+  setConnectManSpendButtonState(button, "idle");
+  button.setAttribute("aria-label", "Сумма кредитов мужчины (все женщины)");
+  button.addEventListener("click", handleConnectManSpendButtonClick);
+  return button;
+}
+
 function ensureConnectManInfoButtons() {
   try {
     const containers = document.querySelectorAll(CONNECT_COUNTRY_CONTENT_SELECTOR);
@@ -7215,6 +7508,12 @@ function ensureConnectManInfoButtons() {
         actionsWrap.style.alignItems = "center";
         actionsWrap.style.gap = "6px";
         actionsWrap.style.marginRight = "8px";
+        const spendWrap = document.createElement("div");
+        spendWrap.className = CONNECT_MAN_SPEND_CONTAINER_CLASS;
+        spendWrap.style.display = "inline-flex";
+        spendWrap.style.alignItems = "center";
+        spendWrap.style.justifyContent = "center";
+        spendWrap.appendChild(createConnectManSpendButton());
         const tgWrap = document.createElement("div");
         tgWrap.className = CONNECT_MAN_TG_CONTAINER_CLASS;
         tgWrap.style.display = "inline-flex";
@@ -7227,6 +7526,7 @@ function ensureConnectManInfoButtons() {
         infoWrap.style.alignItems = "center";
         infoWrap.style.justifyContent = "center";
         infoWrap.appendChild(createConnectManInfoButton());
+        actionsWrap.appendChild(spendWrap);
         actionsWrap.appendChild(tgWrap);
         actionsWrap.appendChild(infoWrap);
         buttonsWrap.parentElement.insertBefore(actionsWrap, buttonsWrap);
