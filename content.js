@@ -10353,10 +10353,13 @@ function normalizeOperatorId(value) {
 }
 
 function normalizeAgencyId(value) {
-  const num = Number(value);
+  const raw = String(value ?? "").trim();
+  if (!raw) return null;
+  const digits = raw.replace(/\D/g, "") || raw;
+  const num = Number(digits);
   if (!Number.isFinite(num)) return null;
   if (num <= 0) return null;
-  return Math.trunc(num);
+  return String(Math.trunc(num));
 }
 
 function findSenderListOperatorContext(value, depth = 0) {
