@@ -52,6 +52,13 @@ const NORMALIZED_DEFAULT_API_URLS = new Set(
   DEFAULT_API_URLS.map((url) => normalizeApiUrl(url)).filter(Boolean)
 );
 const DEFAULT_API_KEY = "super-secret-key-123"; // e.g. "super-secret-key-123"
+const EXTENSION_VERSION = (() => {
+  try {
+    return String(chrome?.runtime?.getManifest?.()?.version || "").trim();
+  } catch {
+    return "";
+  }
+})();
 const SERVER_AUTH_PASS_KEY = "OT4ET_SERVER_AUTH_PASS";
 const SERVER_AUTH_ALLOWED_KEY = "OT4ET_SERVER_AUTH_ALLOWED";
 const SERVER_AUTH_CHECKED_KEY = "OT4ET_SERVER_AUTH_CHECKED_AT";
@@ -206,6 +213,14 @@ function storageSet(key, value) {
       resolve();
     }
   });
+}
+
+function withExtensionVersionHeader(headers = {}) {
+  const next = { ...(headers || {}) };
+  if (EXTENSION_VERSION) {
+    next["X-Extension-Version"] = EXTENSION_VERSION;
+  }
+  return next;
 }
 
 function sanitizeMonitorCounts(raw) {
@@ -588,7 +603,10 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
             ? `${trimmedBase}&male_id=${encodeURIComponent(maleId)}`
             : `${trimmedBase}?male_id=${encodeURIComponent(maleId)}`;
           try {
-            const res = await fetch(url, { method: "GET", headers });
+            const res = await fetch(url, {
+              method: "GET",
+              headers: withExtensionVersionHeader(headers),
+            });
             if (!res.ok) {
               const text = await res.text().catch(() => "");
               sendResponse({
@@ -651,7 +669,10 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
             ? `${trimmedBase}&male_id=${encodeURIComponent(maleId)}`
             : `${trimmedBase}?male_id=${encodeURIComponent(maleId)}`;
           try {
-            const res = await fetch(url, { method: "GET", headers });
+            const res = await fetch(url, {
+              method: "GET",
+              headers: withExtensionVersionHeader(headers),
+            });
             if (!res.ok) {
               const text = await res.text().catch(() => "");
               sendResponse({

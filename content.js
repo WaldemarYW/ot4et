@@ -101,6 +101,13 @@ const EXTENSION_UNLOCKED_KEY = "OT4ET_EXTENSION_UNLOCKED";
 const EXTENSION_UNLOCKED_AT_KEY = "OT4ET_EXTENSION_UNLOCKED_AT";
 const EXTENSION_AUTH_CHECKED_AT_KEY = "OT4ET_EXTENSION_AUTH_CHECKED_AT";
 const EXTENSION_INSTALL_ID_KEY = "OT4ET_INSTALL_ID";
+const EXTENSION_VERSION = (() => {
+  try {
+    return String(chrome?.runtime?.getManifest?.()?.version || "").trim();
+  } catch {
+    return "";
+  }
+})();
 
 const LANG = {
   ru: {
@@ -542,7 +549,7 @@ async function syncChatSpendMaxToServer(entry) {
       };
       const res = await fetch(`${base}${CHAT_SPEND_UPSERT_ENDPOINT}`, {
         method: "POST",
-        headers,
+        headers: withExtensionVersionHeader(headers),
         body: JSON.stringify(payload),
       });
       if (!res.ok) return false;
@@ -2936,6 +2943,14 @@ async function setStore(obj) {
   }
 }
 
+function withExtensionVersionHeader(headers = {}) {
+  const next = { ...(headers || {}) };
+  if (EXTENSION_VERSION) {
+    next["X-Extension-Version"] = EXTENSION_VERSION;
+  }
+  return next;
+}
+
 function isExtensionLocked() {
   return !!extensionLocked;
 }
@@ -3074,7 +3089,11 @@ async function submitAuthModal() {
       const ok = await verifyServerAccessPassword(pwd);
       if (!ok) {
         await persistExtensionUnlockState(false);
-        updateAuthModalError("Неверный пароль или сервер недоступен");
+        updateAuthModalError(
+          serverAuthLastFailureKind === "upgrade_required"
+            ? "Обновите расширение до последней версии"
+            : "Неверный пароль или сервер недоступен"
+        );
         return false;
       }
       await persistExtensionUnlockState(true);
@@ -3296,6 +3315,7 @@ async function loadServerAuthState() {
     serverAuthChecking = !!serverAuthPassword;
     if (!serverAuthPassword) {
       serverAuthChecking = false;
+      serverAuthOperatorUsageKey = "";
     }
   } catch {}
   serverAuthStateLoaded = true;
@@ -3329,7 +3349,7 @@ async function verifyServerAccessPassword(password, opts = {}) {
         : "";
     const res = await fetch(`${base}/auth/check`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: withExtensionVersionHeader({ "Content-Type": "application/json" }),
       body: JSON.stringify({
         password,
         install_id: installId || undefined,
@@ -3337,6 +3357,18 @@ async function verifyServerAccessPassword(password, opts = {}) {
         agency_id: agencyId || undefined,
       }),
     });
+    if (res.status === 426) {
+      serverAuthLastFailureKind = "upgrade_required";
+      serverAuthAllowed = false;
+      serverAuthChecking = false;
+      serverAuthCheckedAt = Date.now();
+      serverAuthPassword = "";
+      serverAuthOperatorUsageKey = "";
+      await persistExtensionUnlockState(false);
+      await persistServerAuthState();
+      pulseServerAccessUI();
+      return false;
+    }
     if (!res.ok) {
       serverAuthLastFailureKind = "soft";
       serverAuthChecking = false;
@@ -3423,7 +3455,7 @@ async function syncServerAuthOperatorUsage() {
   try {
     const res = await fetch(`${base}/auth/check`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: withExtensionVersionHeader({ "Content-Type": "application/json" }),
       body: JSON.stringify({
         password,
         install_id: installId,
@@ -3566,7 +3598,10 @@ async function fetchOperatorsRating({ metric, scope, limit = OPERATOR_RATING_LIM
   const url = `${base}${OPERATOR_RATING_ENDPOINT}?${params.toString()}`;
   let response;
   try {
-    response = await fetch(url, { method: "GET" });
+    response = await fetch(url, {
+      method: "GET",
+      headers: withExtensionVersionHeader(),
+    });
   } catch {
     throw new Error("Сервер недоступен");
   }
@@ -5829,7 +5864,7 @@ async function flushProfileShiftDeltaQueue() {
     try {
       const res = await fetch(`${base}/profiles/shift/delta`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: withExtensionVersionHeader({ "Content-Type": "application/json" }),
         body: JSON.stringify({
           day_key: group.day_key,
           profiles: group.profiles,
@@ -6112,7 +6147,7 @@ async function flushOperatorShiftSnapshotQueue() {
   try {
     const res = await fetch(`${base}/operators/shift/snapshot`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: withExtensionVersionHeader({ "Content-Type": "application/json" }),
       body: JSON.stringify(entry),
     });
     if (!res.ok) return;
@@ -6135,7 +6170,10 @@ async function fetchOperatorShiftSummary() {
       `${base}/operators/shift?operator_id=${encodeURIComponent(
         operatorId
       )}&day_key=${encodeURIComponent(dayKey)}`,
-      { method: "GET" }
+      {
+        method: "GET",
+        headers: withExtensionVersionHeader(),
+      }
     );
     if (!res.ok) return;
     const data = await res.json().catch(() => ({}));
@@ -6282,7 +6320,7 @@ async function sendOperatorShiftSnapshot(balanceTotal) {
     await flushOperatorShiftSnapshotQueue();
     const res = await fetch(`${base}/operators/shift/snapshot`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: withExtensionVersionHeader({ "Content-Type": "application/json" }),
       body: JSON.stringify(payload),
     });
     if (!res.ok) {
@@ -6327,7 +6365,7 @@ async function fetchProfileShiftStatsBatch(profileIds) {
   try {
     const res = await fetch(`${base}/profiles/shift/batch`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: withExtensionVersionHeader({ "Content-Type": "application/json" }),
       body: JSON.stringify({ day_key: dayKey, profile_ids: ids }),
     });
     if (!res.ok) return;
@@ -6425,7 +6463,7 @@ async function sendProfileShiftDeltas(profileIds) {
     await flushProfileShiftDeltaQueue();
     const res = await fetch(`${base}/profiles/shift/delta`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: withExtensionVersionHeader({ "Content-Type": "application/json" }),
       body: JSON.stringify({ day_key: dayKey, profiles: payload }),
     });
     if (!res.ok) {
@@ -7306,7 +7344,10 @@ async function fetchChatSpendTotalByMaleId(maleId) {
   const url = `${base}${CHAT_SPEND_TOTAL_BY_MALE_ENDPOINT}?male_id=${encodeURIComponent(
     normalizedMaleId
   )}`;
-  const res = await fetch(url, { method: "GET", headers });
+  const res = await fetch(url, {
+    method: "GET",
+    headers: withExtensionVersionHeader(headers),
+  });
   if (!res.ok) return null;
   const data = await res.json().catch(() => ({}));
   if (!data || data.ok !== true) return null;
@@ -14976,7 +15017,10 @@ async function checkReportsIndicator() {
       const res = await fetch(
         `${base}/reports/shift/exists?male_id=${encodeURIComponent(
           maleId
-        )}&female_id=${encodeURIComponent(femaleId)}`
+        )}&female_id=${encodeURIComponent(femaleId)}`,
+        {
+          headers: withExtensionVersionHeader(),
+        }
       );
       if (!res.ok) {
         setSearchReportsIndicatorNew(false);
@@ -15030,7 +15074,7 @@ async function sendReportShiftSnapshot(man, woman, text) {
   try {
     const res = await fetch(`${base}/reports/shift/snapshot`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: withExtensionVersionHeader({ "Content-Type": "application/json" }),
       body: JSON.stringify(payload),
     });
     if (!res.ok) {
@@ -15073,7 +15117,10 @@ async function fetchReportShiftList(man, woman) {
     const res = await fetch(
       `${base}/reports/shift?male_id=${encodeURIComponent(
         maleId
-      )}&female_id=${encodeURIComponent(femaleId)}`
+      )}&female_id=${encodeURIComponent(femaleId)}`,
+      {
+        headers: withExtensionVersionHeader(),
+      }
     );
     if (!res.ok) {
       toast("Сервер недоступен");
@@ -16230,6 +16277,9 @@ window.addEventListener("unload", () => {
         const nextPass = changes[SERVER_AUTH_PASS_KEY]?.newValue;
         if (typeof nextPass === "string") {
           serverAuthPassword = nextPass;
+          if (!nextPass.trim()) {
+            serverAuthOperatorUsageKey = "";
+          }
         }
         if (typeof nextAllowed === "boolean") {
           serverAuthAllowed = nextAllowed;
