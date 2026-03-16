@@ -108,6 +108,8 @@ const EXTENSION_VERSION = (() => {
     return "";
   }
 })();
+const EXTENSION_UPDATE_URL =
+  "https://chromewebstore.google.com/detail/neokoaenlhgjggpaldgmjkmmcgljagpm?utm_source=item-share-cb";
 
 const LANG = {
   ru: {
@@ -3051,8 +3053,50 @@ function openOperatorWaitModal() {
   } catch {}
 }
 
+function isUpdateRequiredModalOpen() {
+  try {
+    return !!ui?.updateRequiredModal && !ui.updateRequiredModal.hidden;
+  } catch {
+    return false;
+  }
+}
+
+function closeUpdateRequiredModal() {
+  try {
+    if (!ui?.updateRequiredModal) return;
+    ui.updateRequiredModal.hidden = true;
+    ui.updateRequiredModal.classList.remove("open");
+  } catch {}
+}
+
+function openUpdateRequiredModal() {
+  try {
+    closeAuthModal();
+    closeOperatorWaitModal();
+    if (ui?.drawer) ui.drawer.classList.remove("open");
+    if (ui?.moreBox) ui.moreBox.classList.remove("open");
+    drawerManuallyClosed = true;
+    if (!ui?.updateRequiredModal) return;
+    ui.updateRequiredModal.hidden = false;
+    ui.updateRequiredModal.classList.add("open");
+  } catch {}
+}
+
+function handleUpgradeRequiredState() {
+  serverAuthLastFailureKind = "upgrade_required";
+  try {
+    persistExtensionUnlockState(false).catch(() => {});
+  } catch {}
+  try {
+    persistServerAuthState().catch(() => {});
+  } catch {}
+  openUpdateRequiredModal();
+  updateLauncherVisibility();
+}
+
 function openAuthModal() {
   try {
+    if (isUpdateRequiredModalOpen()) return;
     if (!ui?.authModal) return;
     updateAuthModalError("");
     ui.authModal.hidden = false;
@@ -3072,6 +3116,7 @@ function openAuthModal() {
 
 async function submitAuthModal() {
   if (extensionUnlockInFlight) return false;
+  if (isUpdateRequiredModalOpen()) return false;
   const pwd = String(ui?.authModalInput?.value || "").trim();
   if (!pwd) {
     updateAuthModalError("Введите пароль");
@@ -3089,10 +3134,11 @@ async function submitAuthModal() {
       const ok = await verifyServerAccessPassword(pwd);
       if (!ok) {
         await persistExtensionUnlockState(false);
+        if (serverAuthLastFailureKind === "upgrade_required") {
+          return false;
+        }
         updateAuthModalError(
-          serverAuthLastFailureKind === "upgrade_required"
-            ? "Обновите расширение до последней версии"
-            : "Неверный пароль или сервер недоступен"
+          "Неверный пароль или сервер недоступен"
         );
         return false;
       }
@@ -3127,6 +3173,9 @@ async function submitAuthModal() {
 }
 
 function requireExtensionUnlock() {
+  if (isUpdateRequiredModalOpen()) {
+    return true;
+  }
   if (!isExtensionLocked()) {
     return requireOperatorIdReady();
   }
@@ -3337,6 +3386,7 @@ async function verifyServerAccessPassword(password, opts = {}) {
   serverAuthStateLoaded = true;
   try {
     const includeUsage = opts?.trackUsage !== false;
+    const countSuccess = opts?.countSuccess !== false;
     const updateExtensionUnlockState = opts?.updateExtensionUnlockState !== false;
     const installId = includeUsage ? await ensureInstallId() : "";
     const operatorId = includeUsage
@@ -3355,10 +3405,10 @@ async function verifyServerAccessPassword(password, opts = {}) {
         install_id: installId || undefined,
         operator_id: operatorId || undefined,
         agency_id: agencyId || undefined,
+        count_success: countSuccess,
       }),
     });
     if (res.status === 426) {
-      serverAuthLastFailureKind = "upgrade_required";
       serverAuthAllowed = false;
       serverAuthChecking = false;
       serverAuthCheckedAt = Date.now();
@@ -3366,6 +3416,7 @@ async function verifyServerAccessPassword(password, opts = {}) {
       serverAuthOperatorUsageKey = "";
       await persistExtensionUnlockState(false);
       await persistServerAuthState();
+      handleUpgradeRequiredState();
       pulseServerAccessUI();
       return false;
     }
@@ -3461,6 +3512,7 @@ async function syncServerAuthOperatorUsage() {
         install_id: installId,
         operator_id: operatorId,
         agency_id: agencyId || undefined,
+        count_success: false,
       }),
     });
     if (!res.ok) return false;
@@ -3490,6 +3542,7 @@ async function ensureServerAccess(opts = {}) {
         skipPersist: true,
         trackUsage: false,
         syncOperatorUsage: false,
+        countSuccess: false,
         updateExtensionUnlockState: false,
       });
       return ok;
@@ -3815,6 +3868,8 @@ function buildRatingTableRows({ metric, scope, items }) {
   items.forEach((item, index) => {
     const operatorId = normalizeOperatorIdString(item?.operator_id);
     const operatorName = String(item?.operator_name || "").trim() || `ID ${operatorId || "—"}`;
+    const teamName = String(item?.team_name || "").trim();
+    const operatorLabel = teamName ? `${operatorName} • ${teamName}` : operatorName;
     const valueRaw = Number(item?.value) || 0;
     const value = valueRaw.toFixed(2);
     const chat = String(Math.max(0, Number(item?.chat_count) || 0));
@@ -3833,13 +3888,13 @@ function buildRatingTableRows({ metric, scope, items }) {
     if (isBalance) {
       row.innerHTML = `
         <span>${index + 1}</span>
-        <span title="${escapeHtml(operatorName)}">${escapeHtml(operatorName)}</span>
+        <span title="${escapeHtml(operatorLabel)}">${escapeHtml(operatorLabel)}</span>
         <span>${escapeHtml(value)}</span>
       `.trim();
     } else {
       row.innerHTML = `
         <span>${index + 1}</span>
-        <span title="${escapeHtml(operatorName)}">${escapeHtml(operatorName)}</span>
+        <span title="${escapeHtml(operatorLabel)}">${escapeHtml(operatorLabel)}</span>
         <span>${escapeHtml(chat)}</span>
         <span>${escapeHtml(mail)}</span>
         <span>${escapeHtml(total)}</span>
@@ -12842,6 +12897,19 @@ function buildPanel() {
       .operator-wait-modal-actions{display:flex;justify-content:flex-end}
       .operator-wait-modal-btn{padding:7px 14px;font-size:13px;line-height:1.2;border:1px solid #1f4f74;
         border-radius:var(--ar-radius, 3px);background:#1f4f74;color:#fff;cursor:pointer}
+      .update-required-modal{position:fixed;inset:0;display:none;align-items:center;justify-content:center;
+        background:rgba(14,24,38,0.55);z-index:2147483647;padding:16px;box-sizing:border-box}
+      .update-required-modal.open{display:flex}
+      .update-required-modal[hidden]{display:none}
+      .update-required-modal-dialog{width:min(420px, 100%);display:flex;flex-direction:column;gap:12px;
+        background:#fff;border:1px solid var(--ar-border, ${PANEL_BORDER});border-radius:var(--ar-radius, 3px);
+        box-shadow:0 18px 38px rgba(14,24,38,0.28);padding:14px}
+      .update-required-modal-title{font-size:16px;font-weight:700;line-height:1.2}
+      .update-required-modal-text{font-size:14px;line-height:1.35;color:#0f2d4a}
+      .update-required-modal-actions{display:flex;justify-content:flex-end;gap:8px}
+      .update-required-modal-btn{padding:7px 10px;font-size:13px;line-height:1.2;border:1px solid var(--ar-border, ${PANEL_BORDER});
+        border-radius:var(--ar-radius, 3px);background:#fff;color:#000;cursor:pointer}
+      .update-required-modal-btn.primary{background:#1f4f74;border-color:#1f4f74;color:#fff}
     </style>
     <div class="auth-modal" id="authModal" hidden>
       <div class="auth-modal-dialog" role="dialog" aria-modal="true" aria-labelledby="authModalTitle">
@@ -12862,6 +12930,16 @@ function buildPanel() {
         )}</div>
         <div class="operator-wait-modal-actions">
           <button type="button" id="operatorWaitModalOk" class="operator-wait-modal-btn">ОК</button>
+        </div>
+      </div>
+    </div>
+    <div class="update-required-modal" id="updateRequiredModal" hidden>
+      <div class="update-required-modal-dialog" role="dialog" aria-modal="true" aria-labelledby="updateRequiredModalTitle">
+        <div class="update-required-modal-title" id="updateRequiredModalTitle">Требуется обновление</div>
+        <div class="update-required-modal-text">Для работы расширения нужно обновиться до новой версии</div>
+        <div class="update-required-modal-actions">
+          <button type="button" id="updateRequiredModalClose" class="update-required-modal-btn">Закрыть</button>
+          <button type="button" id="updateRequiredModalOpen" class="update-required-modal-btn primary">Обновить расширение</button>
         </div>
       </div>
     </div>
@@ -13007,6 +13085,9 @@ function buildPanel() {
     authModalError: shadow.getElementById("authModalError"),
     operatorWaitModal: shadow.getElementById("operatorWaitModal"),
     operatorWaitModalOk: shadow.getElementById("operatorWaitModalOk"),
+    updateRequiredModal: shadow.getElementById("updateRequiredModal"),
+    updateRequiredModalClose: shadow.getElementById("updateRequiredModalClose"),
+    updateRequiredModalOpen: shadow.getElementById("updateRequiredModalOpen"),
     lettersNewWindowToggle: shadow.getElementById("lettersNewWindowToggle"),
     wsEventsDisabledToggle: shadow.getElementById("wsEventsDisabledToggle"),
     webhooksPaidFilterToggle: shadow.getElementById("webhooksPaidFilterToggle"),
@@ -13129,6 +13210,33 @@ function buildPanel() {
       }
     });
   }
+  if (ui.updateRequiredModalClose) {
+    ui.updateRequiredModalClose.onclick = () => {
+      closeUpdateRequiredModal();
+      updateLauncherVisibility();
+    };
+  }
+  if (ui.updateRequiredModalOpen) {
+    ui.updateRequiredModalOpen.onclick = () => {
+      try {
+        window.open(EXTENSION_UPDATE_URL, "_blank", "noopener,noreferrer");
+      } catch {}
+    };
+  }
+  if (ui.updateRequiredModal) {
+    ui.updateRequiredModal.addEventListener("click", (event) => {
+      if (event.target === ui.updateRequiredModal) {
+        closeUpdateRequiredModal();
+        updateLauncherVisibility();
+      }
+    });
+  }
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape" && isUpdateRequiredModalOpen()) {
+      closeUpdateRequiredModal();
+      updateLauncherVisibility();
+    }
+  });
   initMonitorCounterSync();
   (async () => {
     if (!ui.userInfo || !ui.userInfoMenu) return;
@@ -13910,6 +14018,10 @@ function fillHeader() {
     if (!wasOpen && serverAuthPassword) {
       const accessAllowed = await ensureServerAccess({ force: true });
       if (!accessAllowed) {
+        if (serverAuthLastFailureKind === "upgrade_required") {
+          handleUpgradeRequiredState();
+          return;
+        }
         if (serverAuthLastFailureKind === "hard") {
           await persistExtensionUnlockState(false);
           ui.drawer.classList.remove("open");
