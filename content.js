@@ -358,7 +358,11 @@ const OPERATOR_RATING_CACHE_TTL_MS = 5 * 60 * 1000;
 
 function notifyMonitorRecord(kind, profileId, count) {
   try {
+    const rawOperatorId = String(operatorInfoState?.operatorId || "").trim();
+    const normalizedOperatorId = rawOperatorId.replace(/\D/g, "") || rawOperatorId;
+    if (!normalizedOperatorId) return;
     const payload = { type: "monitor:record", kind };
+    payload.operatorId = normalizedOperatorId;
     if (profileId) payload.profileId = profileId;
     if (Number.isFinite(Number(count)) && Number(count) > 0) {
       payload.count = Math.max(1, Math.round(Number(count)));
@@ -1016,9 +1020,9 @@ function applySenderListPayload(payload) {
         parsed = JSON.parse(parsed);
       } catch {}
     }
-    const operatorId = extractOperatorIdFromSenderListPayload(parsed);
-    if (!operatorId) return;
-    setOperatorInfoId(operatorId);
+    const context = extractSenderListOperatorContext(parsed);
+    if (!context?.operatorId) return;
+    setOperatorInfoId(context.operatorId, { agencyId: context.agencyId });
   } catch {}
 }
 
@@ -1998,6 +2002,7 @@ function createBalanceMonitorWidget() {
           }, 0);
       elements.total.textContent = total.toFixed(2);
       syncLogoWhiteSquareBalanceFromWidget();
+      rememberCurrentOperatorBalanceSource();
       const filtered = entries.filter((item) => {
         const type = item?.action_type;
         if (FILTER_NO_MSG && type === "SENT_TEXT") return false;
@@ -2249,8 +2254,10 @@ const PROFILE_PHOTO_HOTKEY_DEFAULT = "ctrl+p";
 const TRANSLATE_SEND_HOTKEY_STORAGE_KEY = "translateSendHotkey";
 const TRANSLATE_SEND_HOTKEY_DEFAULT = "ctrl+g";
 const OPERATOR_WAIT_SQUARE_MESSAGE = "Включите сендер";
+const AUTH_REQUIRED_SQUARE_MESSAGE = "Введите пароль";
 const OPERATOR_WAIT_MODAL_MESSAGE =
   "Для начала работы с расширением OT4ET включите сендер";
+const AUTH_REQUIRED_MODAL_MESSAGE = "Введите пароль, чтобы продолжить работу.";
 const CHAT_UID_LOOKUP_URL =
   "https://alpha.date/api/chatList/chatUidByProfileAndUserIds";
 
@@ -2973,14 +2980,21 @@ async function persistExtensionUnlockState(unlocked) {
 
 async function loadExtensionLockState() {
   try {
-    const store = await getStore([EXTENSION_UNLOCKED_KEY]);
+    const store = await getStore([
+      EXTENSION_UNLOCKED_KEY,
+      EXTENSION_UNLOCKED_AT_KEY,
+      EXTENSION_AUTH_CHECKED_AT_KEY,
+    ]);
     const unlocked = !!store?.[EXTENSION_UNLOCKED_KEY];
     extensionLocked = !unlocked;
     if (unlocked) {
       serverAuthAllowed = true;
+    } else {
+      serverAuthAllowed = false;
     }
   } catch {
     extensionLocked = true;
+    serverAuthAllowed = false;
   }
   try {
     scheduleLogoWhiteSquarePlacement();
@@ -3100,9 +3114,15 @@ function requireExtensionUnlock() {
   try {
     ui?.drawer?.classList?.remove("open");
     ui?.moreBox?.classList?.remove("open");
-    closeOperatorWaitModal();
     drawerManuallyClosed = true;
   } catch {}
+  closeAuthModal();
+  if (!hasValidOperatorId()) {
+    openOperatorWaitModal();
+    updateLauncherVisibility();
+    return true;
+  }
+  closeOperatorWaitModal();
   openAuthModal();
   updateLauncherVisibility();
   return true;
@@ -3117,20 +3137,43 @@ function isUiBlockedByMissingOperatorId() {
   return !isExtensionLocked() && !operatorIdReady;
 }
 
+function getLogoSquareStatusState() {
+  if (!hasValidOperatorId() || !operatorIdReady) {
+    return {
+      active: true,
+      message: OPERATOR_WAIT_SQUARE_MESSAGE,
+      title: OPERATOR_WAIT_MODAL_MESSAGE,
+    };
+  }
+  if (isExtensionLocked()) {
+    return {
+      active: true,
+      message: AUTH_REQUIRED_SQUARE_MESSAGE,
+      title: AUTH_REQUIRED_MODAL_MESSAGE,
+    };
+  }
+  return {
+    active: false,
+    message: "",
+    title: "",
+  };
+}
+
 function updateLogoSquareOperatorWaitState() {
-  const waitMode = isUiBlockedByMissingOperatorId();
+  const status = getLogoSquareStatusState();
+  const waitMode = !!status.active;
   forEachLogoWhiteSquareCounterNode("counter", (node) => {
     node.classList.toggle("operator-wait", waitMode);
     if (waitMode) {
-      node.title = OPERATOR_WAIT_MODAL_MESSAGE;
+      node.title = status.title;
     } else {
       node.removeAttribute("title");
     }
   });
   forEachLogoWhiteSquareCounterNode("total", (node) => {
     if (waitMode) {
-      node.textContent = OPERATOR_WAIT_SQUARE_MESSAGE;
-      node.title = OPERATOR_WAIT_MODAL_MESSAGE;
+      node.textContent = status.message;
+      node.title = status.title;
     } else {
       node.removeAttribute("title");
     }
@@ -3150,6 +3193,11 @@ function setOperatorIdAvailability(nextReady, source = "") {
   operatorIdWaitMode = !ready;
   updateLogoSquareOperatorWaitState();
   if (isExtensionLocked()) {
+    if (ready) {
+      closeOperatorWaitModal();
+    } else {
+      closeAuthModal();
+    }
     updateLauncherVisibility();
     return;
   }
@@ -3269,13 +3317,24 @@ async function verifyServerAccessPassword(password, opts = {}) {
   serverAuthStateLoaded = true;
   try {
     const includeUsage = opts?.trackUsage !== false;
+    const updateExtensionUnlockState = opts?.updateExtensionUnlockState !== false;
     const installId = includeUsage ? await ensureInstallId() : "";
+    const operatorId = includeUsage
+      ? normalizeOperatorIdString(operatorInfoState?.operatorId)
+      : "";
+    const agencyId = includeUsage ? normalizeAgencyId(operatorInfoState?.agencyId) : null;
+    const usageKey =
+      includeUsage && installId && operatorId
+        ? `${password}::${installId}::${operatorId}::${agencyId || ""}`
+        : "";
     const res = await fetch(`${base}/auth/check`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         password,
         install_id: installId || undefined,
+        operator_id: operatorId || undefined,
+        agency_id: agencyId || undefined,
       }),
     });
     if (!res.ok) {
@@ -3295,7 +3354,7 @@ async function verifyServerAccessPassword(password, opts = {}) {
     serverAuthChecking = false;
     serverAuthCheckedAt = Date.now();
     serverAuthLastFailureKind = ok ? "" : "hard";
-    if (!ok && !isExtensionLocked()) {
+    if (!ok && !isExtensionLocked() && updateExtensionUnlockState) {
       await persistExtensionUnlockState(false);
       try {
         ui?.drawer?.classList?.remove("open");
@@ -3305,7 +3364,10 @@ async function verifyServerAccessPassword(password, opts = {}) {
     if (ok && !opts.skipPersist) {
       serverAuthPassword = password;
     }
-    if (ok) {
+    if (ok && usageKey) {
+      serverAuthOperatorUsageKey = usageKey;
+    }
+    if (ok && updateExtensionUnlockState) {
       await persistExtensionUnlockState(true);
     }
     await persistServerAuthState();
@@ -3325,6 +3387,11 @@ async function verifyServerAccessPassword(password, opts = {}) {
       try {
         await fetchOperatorShiftSummary();
       } catch {}
+      if (opts?.syncOperatorUsage !== false) {
+        try {
+          await syncServerAuthOperatorUsage();
+        } catch {}
+      }
     }
     return ok;
   } catch {
@@ -3334,6 +3401,42 @@ async function verifyServerAccessPassword(password, opts = {}) {
     serverAuthCheckedAt = Date.now();
     await persistServerAuthState();
     pulseServerAccessUI();
+    return false;
+  }
+}
+
+async function syncServerAuthOperatorUsage() {
+  if (isExtensionLocked()) return false;
+  const password = String(serverAuthPassword || "").trim();
+  if (!password) return false;
+  const operatorId = normalizeOperatorIdString(operatorInfoState?.operatorId);
+  if (!operatorId) return false;
+  const agencyId = normalizeAgencyId(operatorInfoState?.agencyId);
+  const installId = await ensureInstallId();
+  if (!installId) return false;
+  const base = await getProfileStatsApiBaseRaw();
+  if (!base) return false;
+  const usageKey = `${password}::${installId}::${operatorId}::${agencyId || ""}`;
+  if (serverAuthOperatorUsageKey === usageKey) {
+    return true;
+  }
+  try {
+    const res = await fetch(`${base}/auth/check`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        password,
+        install_id: installId,
+        operator_id: operatorId,
+        agency_id: agencyId || undefined,
+      }),
+    });
+    if (!res.ok) return false;
+    const data = await res.json().catch(() => ({}));
+    if (!data?.ok) return false;
+    serverAuthOperatorUsageKey = usageKey;
+    return true;
+  } catch {
     return false;
   }
 }
@@ -3354,6 +3457,8 @@ async function ensureServerAccess(opts = {}) {
       const ok = await verifyServerAccessPassword(serverAuthPassword, {
         skipPersist: true,
         trackUsage: false,
+        syncOperatorUsage: false,
+        updateExtensionUnlockState: false,
       });
       return ok;
     }
@@ -4970,6 +5075,7 @@ const AUTO_PROFILES_REFRESH_MS = 5 * 60 * 1000;
 let lastProfilesRefreshAt = 0;
 const operatorInfoState = {
   operatorId: null,
+  agencyId: null,
   operatorName: "",
   operatorNameUpdatedAt: 0,
   error: "",
@@ -4981,6 +5087,7 @@ let serverAuthPassword = "";
 let serverAuthCheckPromise = null;
 let serverAuthLastFailureKind = "";
 let serverAuthStateLoaded = false;
+let serverAuthOperatorUsageKey = "";
 let extensionLocked = true;
 let operatorIdReady = false;
 let operatorIdWaitMode = true;
@@ -5102,6 +5209,7 @@ let logoWhiteSquareEl = null;
 let logoWhiteSquareHostEl = null;
 let logoWhiteSquareCounterEls = null;
 let logoWhiteSquareBalanceCachedValue = null;
+let logoWhiteSquareBalanceSourceOperatorId = "";
 let logoWhiteSquareMenuEl = null;
 let logoWhiteSquareObserver = null;
 let logoWhiteSquareInitialized = false;
@@ -5350,16 +5458,57 @@ function setLogoWhiteSquareBalanceValue(value) {
   });
 }
 
+function getCurrentOperatorBalanceCacheId() {
+  return normalizeOperatorIdString(operatorInfoState?.operatorId);
+}
+
+function getCurrentOperatorSummaryCache() {
+  const currentOperatorId = getCurrentOperatorBalanceCacheId();
+  if (!currentOperatorId || !operatorShiftSummaryCache || typeof operatorShiftSummaryCache !== "object") {
+    return null;
+  }
+  const cachedOperatorId = normalizeOperatorIdString(
+    operatorShiftSummaryCache?.operator_id || operatorShiftSummaryCache?.operatorId
+  );
+  if (!cachedOperatorId || cachedOperatorId !== currentOperatorId) {
+    return null;
+  }
+  const cachedDayKey = String(
+    operatorShiftSummaryCache?.day_key || operatorShiftSummaryCache?.dayKey || ""
+  ).trim();
+  if (cachedDayKey && cachedDayKey !== getKyivDayKey()) {
+    return null;
+  }
+  return operatorShiftSummaryCache;
+}
+
+function rememberCurrentOperatorBalanceSource() {
+  logoWhiteSquareBalanceSourceOperatorId = getCurrentOperatorBalanceCacheId();
+}
+
+function clearCurrentOperatorBalanceState() {
+  operatorShiftSummaryCache = null;
+  try {
+    persistOperatorShiftSummaryCache();
+  } catch {}
+  logoWhiteSquareBalanceCachedValue = null;
+  logoWhiteSquareBalanceSourceOperatorId = "";
+  setLogoWhiteSquareBalanceValue(0);
+}
+
 function applyLogoWhiteSquareCachedBalanceValue() {
   try {
-    if (operatorShiftSummaryCache && operatorShiftSummaryCache.balance_total != null) {
-      const num = Number(operatorShiftSummaryCache.balance_total);
+    const summaryCache = getCurrentOperatorSummaryCache();
+    if (summaryCache && summaryCache.balance_total != null) {
+      const num = Number(summaryCache.balance_total);
       if (Number.isFinite(num)) {
         setLogoWhiteSquareBalanceValue(num);
+        rememberCurrentOperatorBalanceSource();
         return;
       }
     }
   } catch {}
+  const currentOperatorId = getCurrentOperatorBalanceCacheId();
   if (logoWhiteSquareBalanceCachedValue === null) {
     try {
       const fallback = ui?.balanceMonitor?.element
@@ -5370,27 +5519,45 @@ function applyLogoWhiteSquareCachedBalanceValue() {
       }
     } catch {}
   }
-  if (logoWhiteSquareBalanceCachedValue !== null) {
+  if (
+    logoWhiteSquareBalanceCachedValue !== null &&
+    currentOperatorId &&
+    logoWhiteSquareBalanceSourceOperatorId === currentOperatorId
+  ) {
     setLogoWhiteSquareBalanceValue(logoWhiteSquareBalanceCachedValue);
   }
 }
 
-function getCurrentOperatorBalanceTotal() {
+function getCurrentOperatorBalanceTotal({ trustedOnly = false } = {}) {
   try {
-    if (
-      operatorShiftSummaryCache &&
-      operatorShiftSummaryCache.balance_total != null
-    ) {
-      const num = Number(operatorShiftSummaryCache.balance_total);
+    const summaryCache = getCurrentOperatorSummaryCache();
+    if (summaryCache && summaryCache.balance_total != null) {
+      const num = Number(summaryCache.balance_total);
       if (Number.isFinite(num)) return num;
     }
   } catch {}
+  const currentOperatorId = getCurrentOperatorBalanceCacheId();
   try {
-    if (logoWhiteSquareBalanceCachedValue != null) {
+    if (
+      currentOperatorId &&
+      logoWhiteSquareBalanceSourceOperatorId === currentOperatorId &&
+      logoWhiteSquareBalanceCachedValue != null
+    ) {
       const num = Number(String(logoWhiteSquareBalanceCachedValue).replace(",", "."));
       if (Number.isFinite(num)) return num;
     }
   } catch {}
+  try {
+    if (!trustedOnly) {
+      const fallback = ui?.balanceMonitor?.element
+        ?.querySelector?.("#adb-total")?.textContent;
+      const num = Number(String(fallback || "").replace(",", "."));
+      if (Number.isFinite(num)) return num;
+    }
+  } catch {}
+  if (trustedOnly) {
+    return null;
+  }
   try {
     const fallback = ui?.balanceMonitor?.element
       ?.querySelector?.("#adb-total")?.textContent;
@@ -5973,6 +6140,17 @@ async function fetchOperatorShiftSummary() {
     if (!res.ok) return;
     const data = await res.json().catch(() => ({}));
     if (!data || data.ok !== true) return;
+    const currentOperatorId = normalizeOperatorIdString(operatorInfoState?.operatorId);
+    const requestedOperatorId = normalizeOperatorIdString(operatorId);
+    if (!currentOperatorId || currentOperatorId !== requestedOperatorId) {
+      return;
+    }
+    const summaryOperatorId = normalizeOperatorIdString(
+      data?.summary?.operator_id || data?.summary?.operatorId || requestedOperatorId
+    );
+    if (summaryOperatorId && summaryOperatorId !== currentOperatorId) {
+      return;
+    }
     operatorShiftSummaryCache = data.summary || null;
     try {
       operatorHourlyBalanceMap = new Map();
@@ -8276,7 +8454,10 @@ function createLogoWhiteSquareMenuSections() {
       updated_at: Date.now(),
     });
     updateOperatorNameUI();
-    await sendOperatorShiftSnapshot(getCurrentOperatorBalanceTotal());
+    const trustedBalance = getCurrentOperatorBalanceTotal({ trustedOnly: true });
+    if (trustedBalance !== null) {
+      await sendOperatorShiftSnapshot(trustedBalance);
+    }
     updateNameSaveState();
     operatorNameSave.classList.add("saved");
     setTimeout(() => {
@@ -9217,9 +9398,9 @@ async function sendSenderListForProfiles(token, items) {
     body,
   });
   try {
-    const operatorId = extractOperatorIdFromSenderListPayload(payload);
-    if (operatorId) {
-      setOperatorInfoId(operatorId);
+    const context = extractSenderListOperatorContext(payload);
+    if (context?.operatorId) {
+      setOperatorInfoId(context.operatorId, { agencyId: context.agencyId });
     }
   } catch {}
 }
@@ -9423,17 +9604,6 @@ function setLogoWhiteSquareArrowExpanded(expanded) {
 function ensureLogoWhiteSquarePlacement() {
   logoWhiteSquarePlacementPending = false;
   const target = findElementBySelectors(LOGO_WHITE_SQUARE_SELECTORS);
-  if (isExtensionLocked()) {
-    if (logoWhiteSquareHostEl) {
-      logoWhiteSquareHostEl.classList.remove(LOGO_WHITE_SQUARE_HOST_CLASS);
-      logoWhiteSquareHostEl = null;
-    }
-    if (logoWhiteSquareEl?.parentElement) {
-      logoWhiteSquareEl.parentElement.removeChild(logoWhiteSquareEl);
-    }
-    closeLogoWhiteSquareExpandedPanel();
-    return false;
-  }
   if (!target) {
     if (logoWhiteSquareHostEl) {
       logoWhiteSquareHostEl.classList.remove(LOGO_WHITE_SQUARE_HOST_CLASS);
@@ -10141,44 +10311,56 @@ function normalizeOperatorId(value) {
   return Math.trunc(num);
 }
 
-function findOperatorIdInValue(value, depth = 0) {
+function normalizeAgencyId(value) {
+  const num = Number(value);
+  if (!Number.isFinite(num)) return null;
+  if (num <= 0) return null;
+  return Math.trunc(num);
+}
+
+function findSenderListOperatorContext(value, depth = 0) {
   if (depth > 4) return null;
   if (value === null || value === undefined) return null;
-  if (typeof value === "number" || typeof value === "string") {
-    return normalizeOperatorId(value);
-  }
   if (Array.isArray(value)) {
     for (const item of value) {
-      const found = findOperatorIdInValue(item, depth + 1);
+      const found = findSenderListOperatorContext(item, depth + 1);
       if (found) return found;
     }
     return null;
   }
   if (typeof value === "object") {
-    const direct =
+    const directOperatorId =
       normalizeOperatorId(value.operator_id) ||
       normalizeOperatorId(value.operatorId);
-    if (direct) return direct;
+    const directAgencyId =
+      normalizeAgencyId(value.agency_id) ||
+      normalizeAgencyId(value.agencyId);
+    if (directOperatorId) {
+      return {
+        operatorId: directOperatorId,
+        agencyId: directAgencyId,
+      };
+    }
     const keys = Object.keys(value);
     for (const key of keys) {
-      const found = findOperatorIdInValue(value[key], depth + 1);
+      const found = findSenderListOperatorContext(value[key], depth + 1);
       if (found) return found;
     }
   }
   return null;
 }
 
-function extractOperatorIdFromSenderListPayload(payload) {
+function extractSenderListOperatorContext(payload) {
   if (!payload) return null;
   if (payload.response !== undefined) {
-    const found = findOperatorIdInValue(payload.response, 0);
+    const found = findSenderListOperatorContext(payload.response, 0);
     if (found) return found;
   }
   if (payload.data !== undefined) {
-    const found = findOperatorIdInValue(payload.data, 0);
+    const found = findSenderListOperatorContext(payload.data, 0);
     if (found) return found;
   }
-  return findOperatorIdInValue(payload, 0);
+  return findSenderListOperatorContext(payload, 0);
 }
 
 function updateOperatorInfoUI() {
@@ -10250,19 +10432,37 @@ function isAdminUniversalProfileContainerPresent() {
   }
 }
 
-function setOperatorInfoId(operatorId) {
+function setOperatorInfoId(operatorId, options = {}) {
+  const prevOperatorId = normalizeOperatorIdString(operatorInfoState?.operatorId);
+  const nextOperatorId = normalizeOperatorIdString(operatorId);
+  const nextAgencyId = normalizeAgencyId(options?.agencyId);
   operatorInfoState.operatorId = normalizeOperatorId(operatorId);
+  if (prevOperatorId !== nextOperatorId) {
+    operatorInfoState.agencyId = nextAgencyId;
+  } else if (options && Object.prototype.hasOwnProperty.call(options, "agencyId")) {
+    operatorInfoState.agencyId = nextAgencyId;
+  }
   operatorInfoState.operatorName = "";
   operatorInfoState.operatorNameUpdatedAt = 0;
   operatorHourlyBalanceMap = new Map();
   operatorHourlyBalanceStartMap = new Map();
   operatorHourlyActionsMap = new Map();
   operatorInfoState.error = "";
+  if (prevOperatorId !== nextOperatorId) {
+    clearCurrentOperatorBalanceState();
+  }
+  setMonitorCounterCounts(null);
   updateOperatorInfoUI();
   try {
     setTimeout(updateOperatorInfoUI, 0);
   } catch {}
   setOperatorIdAvailability(hasValidOperatorId(), "setOperatorInfoId");
+  try {
+    requestMonitorCounts();
+  } catch {}
+  try {
+    syncServerAuthOperatorUsage().catch(() => {});
+  } catch {}
   try {
     fetchOperatorShiftSummary();
   } catch {}
@@ -10488,6 +10688,8 @@ function normalizeMonitorCountsPayload(raw) {
       hourChat: 0,
       hourMail: 0,
       hourHistory: [],
+      hourRecord: HOURLY_GOAL_MIN,
+      profileStats: {},
     };
   }
   const chat = Number.isFinite(Number(raw.chat)) ? Number(raw.chat) : 0;
@@ -10514,6 +10716,9 @@ function normalizeMonitorCountsPayload(raw) {
         }))
         .filter((entry) => Number.isFinite(entry.start))
     : [];
+  const hourRecord = Number.isFinite(Number(raw.hourRecord))
+    ? Math.max(HOURLY_GOAL_MIN, Number(raw.hourRecord))
+    : HOURLY_GOAL_MIN;
   const profileStats = Object.create(null);
   if (raw.profileStats && typeof raw.profileStats === "object") {
     Object.entries(raw.profileStats).forEach(([key, value]) => {
@@ -10535,6 +10740,7 @@ function normalizeMonitorCountsPayload(raw) {
     hourChat,
     hourMail,
     hourHistory,
+    hourRecord,
     profileStats,
   };
 }
@@ -10563,7 +10769,11 @@ function scheduleMonitorHourlyRefresh() {
 
 async function resetMonitorCountersForNewDay() {
   try {
-    const resp = await chrome.runtime.sendMessage({ type: "monitor:resetDay" });
+    const operatorId = normalizeOperatorIdString(operatorInfoState?.operatorId);
+    const resp = await chrome.runtime.sendMessage({
+      type: "monitor:resetDay",
+      operatorId: operatorId || "",
+    });
     if (resp?.ok && resp.counts) {
       setMonitorCounterCounts(resp.counts);
       return;
@@ -10583,6 +10793,7 @@ async function resetMonitorCountersForNewDay() {
       hourMail: 0,
       hourHistory: [],
       hourRecord: HOURLY_GOAL_MIN,
+      profileStats: {},
     });
   } catch {}
 }
@@ -10657,7 +10868,7 @@ function formatHourTime(date) {
 }
 
 function updateMonitorCounterUI() {
-  if (isUiBlockedByMissingOperatorId()) {
+  if (getLogoSquareStatusState().active) {
     updateLogoSquareOperatorWaitState();
     return;
   }
@@ -10892,6 +11103,11 @@ function setMonitorCounterCounts(counts) {
 function handleMonitorRuntimeMessage(msg) {
   try {
     if (msg?.type === "monitor:update" && msg.counts) {
+      const currentOperatorId = normalizeOperatorIdString(operatorInfoState?.operatorId);
+      const incomingOperatorId = normalizeOperatorIdString(msg?.operatorId);
+      if (incomingOperatorId && (!currentOperatorId || incomingOperatorId !== currentOperatorId)) {
+        return;
+      }
       setMonitorCounterCounts(msg.counts);
     }
   } catch {}
@@ -10899,9 +11115,19 @@ function handleMonitorRuntimeMessage(msg) {
 
 function requestMonitorCounts() {
   try {
-    chrome.runtime.sendMessage({ type: "monitor:getCounts" }, (resp) => {
+    const operatorId = normalizeOperatorIdString(operatorInfoState?.operatorId);
+    if (!operatorId) {
+      setMonitorCounterCounts(null);
+      return;
+    }
+    chrome.runtime.sendMessage({ type: "monitor:getCounts", operatorId }, (resp) => {
       const err = chrome.runtime.lastError;
       if (err) return;
+      const currentOperatorId = normalizeOperatorIdString(operatorInfoState?.operatorId);
+      const responseOperatorId = normalizeOperatorIdString(resp?.operatorId);
+      if (currentOperatorId && responseOperatorId && currentOperatorId !== responseOperatorId) {
+        return;
+      }
       if (resp?.ok && resp.counts) {
         setMonitorCounterCounts(resp.counts);
       }

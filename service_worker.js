@@ -52,6 +52,12 @@ const NORMALIZED_DEFAULT_API_URLS = new Set(
   DEFAULT_API_URLS.map((url) => normalizeApiUrl(url)).filter(Boolean)
 );
 const DEFAULT_API_KEY = "super-secret-key-123"; // e.g. "super-secret-key-123"
+const SERVER_AUTH_PASS_KEY = "OT4ET_SERVER_AUTH_PASS";
+const SERVER_AUTH_ALLOWED_KEY = "OT4ET_SERVER_AUTH_ALLOWED";
+const SERVER_AUTH_CHECKED_KEY = "OT4ET_SERVER_AUTH_CHECKED_AT";
+const EXTENSION_UNLOCKED_KEY = "OT4ET_EXTENSION_UNLOCKED";
+const EXTENSION_UNLOCKED_AT_KEY = "OT4ET_EXTENSION_UNLOCKED_AT";
+const EXTENSION_AUTH_CHECKED_AT_KEY = "OT4ET_EXTENSION_AUTH_CHECKED_AT";
 
 const MONITOR_STORAGE_KEY = "OT4ET_MONITOR_COUNTERS";
 const KYIV_TIME_ZONE = "Europe/Kiev";
@@ -60,15 +66,8 @@ const KYIV_STANDARD_OFFSET_MINUTES = 120;
 const KYIV_SUMMER_OFFSET_MINUTES = 180;
 let monitorCounts = {
   date: null,
-  chat: 0,
-  mail: 0,
-  hourStart: null,
-  hourTotal: 0,
-  hourChat: 0,
-  hourMail: 0,
-  hourHistory: [],
   hourRecord: 50,
-  profileStats: {},
+  buckets: Object.create(null),
 };
 let monitorReadyPromise = null;
 let kyivDateFormatter = null;
@@ -211,77 +210,30 @@ function storageSet(key, value) {
 
 function sanitizeMonitorCounts(raw) {
   const today = getTodayKey();
-  if (!raw || typeof raw !== "object") {
+  const fallbackRecord = Number.isFinite(Number(raw?.hourRecord))
+    ? Math.max(50, Number(raw.hourRecord))
+    : 50;
+  if (!raw || typeof raw !== "object" || !raw.buckets || typeof raw.buckets !== "object") {
     return {
       date: today,
-      chat: 0,
-      mail: 0,
-      hourStart: getCurrentHourStartMs(),
-      hourTotal: 0,
-      hourChat: 0,
-      hourMail: 0,
-      hourHistory: [],
-      hourRecord: 50,
-      profileStats: {},
+      hourRecord: fallbackRecord,
+      buckets: Object.create(null),
     };
   }
   const date =
     typeof raw.date === "string" && raw.date.trim()
       ? raw.date.trim()
       : today;
-  const chat = Number.isFinite(Number(raw.chat)) ? Number(raw.chat) : 0;
-  const mail = Number.isFinite(Number(raw.mail)) ? Number(raw.mail) : 0;
-  const storedHourStart = Number(raw.hourStart);
-  const hourStart = Number.isFinite(storedHourStart)
-    ? storedHourStart
-    : getCurrentHourStartMs();
-  const hourTotal = Number.isFinite(Number(raw.hourTotal))
-    ? Number(raw.hourTotal)
-    : 0;
-  const hourChat = Number.isFinite(Number(raw.hourChat))
-    ? Number(raw.hourChat)
-    : 0;
-  const hourMail = Number.isFinite(Number(raw.hourMail))
-    ? Number(raw.hourMail)
-    : 0;
-  const hourHistory = Array.isArray(raw.hourHistory)
-    ? raw.hourHistory
-        .map((entry) => ({
-          start: Number(entry?.start) || null,
-          end: Number(entry?.end) || null,
-          total: Number(entry?.total) || 0,
-          chat: Number(entry?.chat) || 0,
-          mail: Number(entry?.mail) || 0,
-        }))
-        .filter((entry) => Number.isFinite(entry.start))
-    : [];
-  const hourRecord = Number.isFinite(Number(raw.hourRecord))
-    ? Math.max(50, Number(raw.hourRecord))
-    : 50;
-  const profileStats = Object.create(null);
-  if (raw.profileStats && typeof raw.profileStats === "object") {
-    Object.entries(raw.profileStats).forEach(([key, value]) => {
-      if (!key) return;
-      const chatCount = Number.isFinite(Number(value?.chat))
-        ? Number(value.chat)
-        : 0;
-      const mailCount = Number.isFinite(Number(value?.mail))
-        ? Number(value.mail)
-        : 0;
-      profileStats[String(key)] = { chat: chatCount, mail: mailCount };
-    });
-  }
+  const buckets = Object.create(null);
+  Object.entries(raw.buckets).forEach(([operatorId, value]) => {
+    const normalizedOperatorId = normalizeMonitorOperatorId(operatorId);
+    if (!normalizedOperatorId) return;
+    buckets[normalizedOperatorId] = sanitizeMonitorBucket(value);
+  });
   return {
     date,
-    chat,
-    mail,
-    hourStart,
-    hourTotal,
-    hourChat,
-    hourMail,
-    hourHistory,
-    hourRecord,
-    profileStats,
+    hourRecord: fallbackRecord,
+    buckets,
   };
 }
 
@@ -298,14 +250,118 @@ function normalizeProfileStatKey(value) {
   return digits || raw || "unknown";
 }
 
-function getProfileStatsMap() {
-  if (!monitorCounts.profileStats || typeof monitorCounts.profileStats !== "object") {
-    monitorCounts.profileStats = {};
-  }
-  return monitorCounts.profileStats;
+function normalizeMonitorOperatorId(value) {
+  const raw = String(value ?? "").trim();
+  if (!raw) return "";
+  const digits = raw.replace(/\D/g, "");
+  const normalized = digits || raw;
+  const num = Number(normalized);
+  if (!Number.isFinite(num) || num <= 0) return "";
+  return String(Math.trunc(num));
 }
 
-function incrementProfileStats(kind, profileId, count = 1) {
+function createEmptyMonitorBucket() {
+  return {
+    chat: 0,
+    mail: 0,
+    hourStart: getCurrentHourStartMs(),
+    hourTotal: 0,
+    hourChat: 0,
+    hourMail: 0,
+    hourHistory: [],
+    profileStats: Object.create(null),
+  };
+}
+
+function sanitizeMonitorBucket(raw) {
+  const bucket = createEmptyMonitorBucket();
+  if (!raw || typeof raw !== "object") {
+    return bucket;
+  }
+  const chat = Number(raw.chat);
+  const mail = Number(raw.mail);
+  const hourStart = Number(raw.hourStart);
+  const hourTotal = Number(raw.hourTotal);
+  const hourChat = Number(raw.hourChat);
+  const hourMail = Number(raw.hourMail);
+  bucket.chat = Number.isFinite(chat) ? chat : 0;
+  bucket.mail = Number.isFinite(mail) ? mail : 0;
+  bucket.hourStart = Number.isFinite(hourStart) ? hourStart : getCurrentHourStartMs();
+  bucket.hourTotal = Number.isFinite(hourTotal) ? hourTotal : 0;
+  bucket.hourChat = Number.isFinite(hourChat) ? hourChat : 0;
+  bucket.hourMail = Number.isFinite(hourMail) ? hourMail : 0;
+  bucket.hourHistory = Array.isArray(raw.hourHistory)
+    ? raw.hourHistory
+        .map((entry) => ({
+          start: Number(entry?.start) || null,
+          end: Number(entry?.end) || null,
+          total: Number(entry?.total) || 0,
+          chat: Number(entry?.chat) || 0,
+          mail: Number(entry?.mail) || 0,
+        }))
+        .filter((entry) => Number.isFinite(entry.start))
+    : [];
+  if (raw.profileStats && typeof raw.profileStats === "object") {
+    Object.entries(raw.profileStats).forEach(([key, value]) => {
+      if (!key) return;
+      const chatCount = Number.isFinite(Number(value?.chat))
+        ? Number(value.chat)
+        : 0;
+      const mailCount = Number.isFinite(Number(value?.mail))
+        ? Number(value.mail)
+        : 0;
+      bucket.profileStats[String(key)] = { chat: chatCount, mail: mailCount };
+    });
+  }
+  return bucket;
+}
+
+function getMonitorBuckets() {
+  if (!monitorCounts.buckets || typeof monitorCounts.buckets !== "object") {
+    monitorCounts.buckets = Object.create(null);
+  }
+  return monitorCounts.buckets;
+}
+
+function getMonitorBucket(operatorId, createIfMissing = true) {
+  const normalizedOperatorId = normalizeMonitorOperatorId(operatorId);
+  if (!normalizedOperatorId) return null;
+  const buckets = getMonitorBuckets();
+  if (!buckets[normalizedOperatorId] && createIfMissing) {
+    buckets[normalizedOperatorId] = createEmptyMonitorBucket();
+  }
+  return buckets[normalizedOperatorId] || null;
+}
+
+function buildMonitorCountsPayload(operatorId) {
+  const bucket = getMonitorBucket(operatorId, false) || createEmptyMonitorBucket();
+  return {
+    operatorId: normalizeMonitorOperatorId(operatorId),
+    chat: Number(bucket.chat) || 0,
+    mail: Number(bucket.mail) || 0,
+    hourStart: Number(bucket.hourStart) || getCurrentHourStartMs(),
+    hourTotal: Number(bucket.hourTotal) || 0,
+    hourChat: Number(bucket.hourChat) || 0,
+    hourMail: Number(bucket.hourMail) || 0,
+    hourHistory: Array.isArray(bucket.hourHistory) ? bucket.hourHistory.slice() : [],
+    hourRecord: Number(monitorCounts.hourRecord) || 50,
+    profileStats:
+      bucket.profileStats && typeof bucket.profileStats === "object"
+        ? { ...bucket.profileStats }
+        : {},
+  };
+}
+
+function getProfileStatsMap(operatorId) {
+  const bucket = getMonitorBucket(operatorId);
+  if (!bucket) return null;
+  if (!bucket.profileStats || typeof bucket.profileStats !== "object") {
+    bucket.profileStats = Object.create(null);
+  }
+  return bucket.profileStats;
+}
+
+function incrementProfileStats(operatorId, kind, profileId, count = 1) {
   const delta =
     Number.isFinite(Number(count)) && Number(count) > 0
       ? Math.round(Number(count))
@@ -314,7 +370,8 @@ function incrementProfileStats(kind, profileId, count = 1) {
     kind === "chat" || kind === "mail"
       ? normalizeProfileStatKey(profileId)
       : "unknown";
-  const map = getProfileStatsMap();
+  const map = getProfileStatsMap(operatorId);
+  if (!map) return;
   if (!map[key]) {
     map[key] = { chat: 0, mail: 0 };
   }
@@ -331,18 +388,10 @@ async function loadMonitorCounts() {
   monitorCounts = sanitizeMonitorCounts(stored);
   const today = getTodayKey();
   if (monitorCounts.date !== today) {
-    const prevRecord = Number(monitorCounts.hourRecord) || 50;
     monitorCounts = {
       date: today,
-      chat: 0,
-      mail: 0,
-      hourStart: getCurrentHourStartMs(),
-      hourTotal: 0,
-      hourChat: 0,
-      hourMail: 0,
-      hourHistory: [],
-      hourRecord: prevRecord,
-      profileStats: {},
+      hourRecord: Number(monitorCounts.hourRecord) || 50,
+      buckets: Object.create(null),
     };
     await persistMonitorCounts();
   }
@@ -352,79 +401,67 @@ async function loadMonitorCounts() {
 async function ensureMonitorDate() {
   const today = getTodayKey();
   if (monitorCounts.date === today) return;
-  const prevRecord = Number(monitorCounts.hourRecord) || 50;
   monitorCounts = {
     date: today,
-    chat: 0,
-    mail: 0,
-    hourStart: getCurrentHourStartMs(),
-    hourTotal: 0,
-    hourChat: 0,
-    hourMail: 0,
-    hourHistory: [],
-    hourRecord: prevRecord,
-    profileStats: {},
+    hourRecord: Number(monitorCounts.hourRecord) || 50,
+    buckets: Object.create(null),
   };
   await persistMonitorCounts();
 }
 
 async function resetMonitorCountsManual() {
   const today = getTodayKey();
-  const prevRecord = Number(monitorCounts.hourRecord) || 50;
   monitorCounts = {
     date: today,
-    chat: 0,
-    mail: 0,
-    hourStart: getCurrentHourStartMs(),
-    hourTotal: 0,
-    hourChat: 0,
-    hourMail: 0,
-    hourHistory: [],
-    hourRecord: prevRecord,
-    profileStats: {},
+    hourRecord: Number(monitorCounts.hourRecord) || 50,
+    buckets: Object.create(null),
   };
   await persistMonitorCounts();
 }
 
-async function ensureMonitorHour() {
+async function ensureMonitorHour(operatorId) {
+  const bucket = getMonitorBucket(operatorId);
+  if (!bucket) return;
   const currentStart = getCurrentHourStartMs();
-  if (!Number.isFinite(Number(monitorCounts.hourStart))) {
-    monitorCounts.hourStart = currentStart;
-    monitorCounts.hourTotal = Number.isFinite(Number(monitorCounts.hourTotal))
-      ? Number(monitorCounts.hourTotal)
+  if (!Number.isFinite(Number(bucket.hourStart))) {
+    bucket.hourStart = currentStart;
+    bucket.hourTotal = Number.isFinite(Number(bucket.hourTotal))
+      ? Number(bucket.hourTotal)
       : 0;
-    monitorCounts.hourChat = Number.isFinite(Number(monitorCounts.hourChat))
-      ? Number(monitorCounts.hourChat)
+    bucket.hourChat = Number.isFinite(Number(bucket.hourChat))
+      ? Number(bucket.hourChat)
       : 0;
-    monitorCounts.hourMail = Number.isFinite(Number(monitorCounts.hourMail))
-      ? Number(monitorCounts.hourMail)
+    bucket.hourMail = Number.isFinite(Number(bucket.hourMail))
+      ? Number(bucket.hourMail)
       : 0;
-    if (!Array.isArray(monitorCounts.hourHistory)) {
-      monitorCounts.hourHistory = [];
+    if (!Array.isArray(bucket.hourHistory)) {
+      bucket.hourHistory = [];
     }
     await persistMonitorCounts();
     return;
   }
-  if (monitorCounts.hourStart === currentStart) return;
-  pushHourlyHistoryEntry(monitorCounts.hourStart);
-  monitorCounts.hourStart = currentStart;
-  monitorCounts.hourTotal = 0;
-  monitorCounts.hourChat = 0;
-  monitorCounts.hourMail = 0;
+  if (bucket.hourStart === currentStart) return;
+  pushHourlyHistoryEntry(operatorId, bucket.hourStart);
+  bucket.hourStart = currentStart;
+  bucket.hourTotal = 0;
+  bucket.hourChat = 0;
+  bucket.hourMail = 0;
   await persistMonitorCounts();
 }
 
-function pushHourlyHistoryEntry(startMs) {
+function pushHourlyHistoryEntry(operatorId, startMs) {
+  const bucket = getMonitorBucket(operatorId);
+  if (!bucket) return;
   if (!Number.isFinite(startMs)) return;
-  const total = Number(monitorCounts.hourTotal) || 0;
-  const chat = Number(monitorCounts.hourChat) || 0;
-  const mail = Number(monitorCounts.hourMail) || 0;
+  const total = Number(bucket.hourTotal) || 0;
+  const chat = Number(bucket.hourChat) || 0;
+  const mail = Number(bucket.hourMail) || 0;
   if (!total && !chat && !mail) return;
-  if (!Array.isArray(monitorCounts.hourHistory)) {
-    monitorCounts.hourHistory = [];
+  if (!Array.isArray(bucket.hourHistory)) {
+    bucket.hourHistory = [];
   }
   const HOUR_MS = 60 * 60 * 1000;
-  monitorCounts.hourHistory.push({
+  bucket.hourHistory.push({
     start: startMs,
     end: startMs + HOUR_MS,
     total,
@@ -436,10 +473,11 @@ function pushHourlyHistoryEntry(startMs) {
   }
 }
 
-function notifyMonitorUpdate() {
+function notifyMonitorUpdate(operatorId) {
   const payload = {
     type: "monitor:update",
-    counts: monitorCounts,
+    operatorId: normalizeMonitorOperatorId(operatorId),
+    counts: buildMonitorCountsPayload(operatorId),
   };
   try {
     chrome.runtime.sendMessage(payload, () => {
@@ -468,30 +506,35 @@ function notifyMonitorUpdate() {
   }
 }
 
-async function incrementMonitorCounter(kind, profileId, count = 1) {
+async function incrementMonitorCounter(kind, operatorId, profileId, count = 1) {
   if (!monitorReadyPromise) {
     monitorReadyPromise = loadMonitorCounts();
   }
   await monitorReadyPromise;
-  await ensureMonitorHour();
   await ensureMonitorDate();
+  const normalizedOperatorId = normalizeMonitorOperatorId(operatorId);
+  if (!normalizedOperatorId) return false;
+  await ensureMonitorHour(normalizedOperatorId);
+  const bucket = getMonitorBucket(normalizedOperatorId);
+  if (!bucket) return false;
   const delta =
     Number.isFinite(Number(count)) && Number(count) > 0
       ? Math.round(Number(count))
       : 1;
   if (kind === "chat") {
-    monitorCounts.chat += delta;
-    monitorCounts.hourChat = (monitorCounts.hourChat || 0) + delta;
+    bucket.chat += delta;
+    bucket.hourChat = (bucket.hourChat || 0) + delta;
   } else if (kind === "mail") {
-    monitorCounts.mail += delta;
-    monitorCounts.hourMail = (monitorCounts.hourMail || 0) + delta;
+    bucket.mail += delta;
+    bucket.hourMail = (bucket.hourMail || 0) + delta;
   } else {
-    return;
+    return false;
   }
-  monitorCounts.hourTotal += delta;
-  incrementProfileStats(kind, profileId, delta);
+  bucket.hourTotal += delta;
+  incrementProfileStats(normalizedOperatorId, kind, profileId, delta);
   await persistMonitorCounts();
-  notifyMonitorUpdate();
+  notifyMonitorUpdate(normalizedOperatorId);
+  return true;
 }
 
 monitorReadyPromise = loadMonitorCounts();
@@ -647,6 +690,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
           sendResponse({ ok: false, error: "bad_kind" });
           return;
         }
+        const operatorId = normalizeMonitorOperatorId(msg.operatorId);
         const rawCount = Number(msg.count);
         const count =
           Number.isFinite(rawCount) && rawCount > 0 ? Math.round(rawCount) : 1;
@@ -654,8 +698,12 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
           typeof msg.profileId === "string" && msg.profileId.trim()
             ? msg.profileId.trim()
             : "";
-        await incrementMonitorCounter(kind, profileId, count);
-        sendResponse({ ok: true });
+        if (!operatorId) {
+          sendResponse({ ok: true, skipped: true });
+          return;
+        }
+        await incrementMonitorCounter(kind, operatorId, profileId, count);
+        sendResponse({ ok: true, counts: buildMonitorCountsPayload(operatorId), operatorId });
         return;
       }
       if (msg.type === "monitor:getCounts") {
@@ -664,8 +712,13 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         }
         await monitorReadyPromise;
         await ensureMonitorDate();
-        await ensureMonitorHour();
-        sendResponse({ ok: true, counts: monitorCounts });
+        const operatorId = normalizeMonitorOperatorId(msg.operatorId);
+        if (!operatorId) {
+          sendResponse({ ok: true, counts: buildMonitorCountsPayload(""), operatorId: "" });
+          return;
+        }
+        await ensureMonitorHour(operatorId);
+        sendResponse({ ok: true, counts: buildMonitorCountsPayload(operatorId), operatorId });
         return;
       }
       if (msg.type === "monitor:resetDay") {
@@ -673,9 +726,12 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
           monitorReadyPromise = loadMonitorCounts();
         }
         await monitorReadyPromise;
-        await ensureMonitorDate();
-        notifyMonitorUpdate();
-        sendResponse({ ok: true, counts: monitorCounts });
+        const operatorId = normalizeMonitorOperatorId(msg.operatorId);
+        await resetMonitorCountsManual();
+        if (operatorId) {
+          notifyMonitorUpdate(operatorId);
+        }
+        sendResponse({ ok: true, counts: buildMonitorCountsPayload(operatorId), operatorId });
         return;
       }
       if (msg.type === "monitor:clear") {
@@ -684,8 +740,11 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         }
         await monitorReadyPromise;
         await resetMonitorCountsManual();
-        notifyMonitorUpdate();
-        sendResponse({ ok: true, counts: monitorCounts });
+        const operatorId = normalizeMonitorOperatorId(msg.operatorId);
+        if (operatorId) {
+          notifyMonitorUpdate(operatorId);
+        }
+        sendResponse({ ok: true, counts: buildMonitorCountsPayload(operatorId), operatorId });
         return;
       }
       sendResponse({ ok: false, error: "unsupported_request" });
@@ -725,7 +784,25 @@ function setupContextMenu() {
   } catch {}
 }
 
-chrome.runtime.onInstalled.addListener(() => setupContextMenu());
+async function resetExtensionAuthStateForUpdate() {
+  try {
+    await chrome.storage.local.set({
+      [EXTENSION_UNLOCKED_KEY]: false,
+      [EXTENSION_UNLOCKED_AT_KEY]: 0,
+      [EXTENSION_AUTH_CHECKED_AT_KEY]: 0,
+      [SERVER_AUTH_PASS_KEY]: "",
+      [SERVER_AUTH_ALLOWED_KEY]: false,
+      [SERVER_AUTH_CHECKED_KEY]: 0,
+    });
+  } catch {}
+}
+
+chrome.runtime.onInstalled.addListener((details) => {
+  setupContextMenu();
+  if (details?.reason === "update") {
+    resetExtensionAuthStateForUpdate().catch(() => {});
+  }
+});
 
 chrome.contextMenus.onClicked.addListener((info, tab) => {
   try {
