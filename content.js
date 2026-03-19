@@ -167,14 +167,20 @@ const LANG = {
     ratingTitleActions: "Действия",
     ratingMainShiftBalance: "Баланс за смену",
     ratingMainShiftActions: "Действия за смену",
+    ratingMainTeams: "Команды",
     ratingTabShift: "За смену",
     ratingTabAllTime: "За всё время",
     ratingColRank: "#",
     ratingColName: "Имя",
+    ratingColTeam: "Команда",
     ratingColValue: "Баланс",
     ratingColChat: "Чаты",
     ratingColMail: "Письма",
     ratingColTotal: "Всего",
+    ratingColOperators: "Операторы",
+    ratingExpandPanel: "Развернуть",
+    ratingCollapsePanel: "Свернуть",
+    ratingTeamTitle: "Команда",
     ratingLoading: "Загрузка рейтинга...",
     ratingEmpty: "Нет данных",
     ratingError: "Не удалось загрузить рейтинг",
@@ -250,14 +256,20 @@ const LANG = {
     ratingTitleActions: "Дії",
     ratingMainShiftBalance: "Баланс за зміну",
     ratingMainShiftActions: "Дії за зміну",
+    ratingMainTeams: "Команди",
     ratingTabShift: "За зміну",
     ratingTabAllTime: "За весь час",
     ratingColRank: "#",
     ratingColName: "Ім'я",
+    ratingColTeam: "Команда",
     ratingColValue: "Баланс",
     ratingColChat: "Чати",
     ratingColMail: "Листи",
     ratingColTotal: "Всього",
+    ratingColOperators: "Оператори",
+    ratingExpandPanel: "Розгорнути",
+    ratingCollapsePanel: "Згорнути",
+    ratingTeamTitle: "Команда",
     ratingLoading: "Завантаження рейтингу...",
     ratingEmpty: "Немає даних",
     ratingError: "Не вдалося завантажити рейтинг",
@@ -362,6 +374,7 @@ const CHAT_SPEND_UPSERT_ENDPOINT = "/chat/spend/upsert";
 const CHAT_SPEND_GET_ENDPOINT = "/chat/spend/max";
 const CHAT_SPEND_SERVER_SYNC_TTL_MS = 60 * 1000;
 const OPERATOR_RATING_ENDPOINT = "/operators/rating";
+const TEAM_RATING_ENDPOINT = "/teams/rating";
 const OPERATOR_RATING_LIMIT = 50;
 const OPERATOR_RATING_CACHE_TTL_MS = 5 * 60 * 1000;
 
@@ -3578,29 +3591,43 @@ function normalizeRatingMetric(value) {
 }
 
 function normalizeRatingMainTab(value) {
-  return value === "shift_actions" || value === "all_time" ? value : "shift_balance";
+  return value === "shift_actions" || value === "all_time" || value === "teams"
+    ? value
+    : "shift_balance";
 }
 
 function normalizeRatingAllTimeSubTab(value) {
   return value === "actions" ? "actions" : "balance";
 }
 
+function normalizeTeamRatingScope(value) {
+  return value === "all_time" ? "all_time" : "shift";
+}
+
 function getRatingQueryByView(mainTab, allTimeSubTab) {
   const normalizedMain = normalizeRatingMainTab(mainTab);
   const normalizedSubTab = normalizeRatingAllTimeSubTab(allTimeSubTab);
+  if (normalizedMain === "teams") {
+    return { kind: "teams", scope: "shift" };
+  }
   if (normalizedMain === "shift_actions") {
-    return { metric: "actions", scope: "shift" };
+    return { kind: "operators", metric: "actions", scope: "shift" };
   }
   if (normalizedMain === "all_time") {
-    return { metric: normalizedSubTab, scope: "all_time" };
+    return { kind: "operators", metric: normalizedSubTab, scope: "all_time" };
   }
-  return { metric: "balance", scope: "shift" };
+  return { kind: "operators", metric: "balance", scope: "shift" };
 }
 
 function getOperatorRatingCacheKey({ metric, scope, dayKey }) {
   const m = normalizeRatingMetric(metric);
   const s = normalizeRatingScope(scope);
   return `rating:${m}:${s}:${s === "shift" ? dayKey || getRatingDayKeyKyiv() : "all"}`;
+}
+
+function getTeamRatingCacheKey({ scope, dayKey }) {
+  const s = normalizeTeamRatingScope(scope);
+  return `team-rating:${s}:${s === "shift" ? dayKey || getRatingDayKeyKyiv() : "all"}`;
 }
 
 function normalizeOperatorIdString(value) {
@@ -3629,6 +3656,20 @@ function sortRatingItems(items, metric) {
     const idA = Number(normalizeOperatorIdString(a?.operator_id)) || 0;
     const idB = Number(normalizeOperatorIdString(b?.operator_id)) || 0;
     return idA - idB;
+  });
+  return arr;
+}
+
+function sortTeamRatingItems(items) {
+  const arr = Array.isArray(items) ? items.slice() : [];
+  arr.sort((a, b) => {
+    const balanceA = Number(a?.balance_total) || 0;
+    const balanceB = Number(b?.balance_total) || 0;
+    if (balanceB !== balanceA) return balanceB - balanceA;
+    const actionsA = Number(a?.actions_total) || 0;
+    const actionsB = Number(b?.actions_total) || 0;
+    if (actionsB !== actionsA) return actionsB - actionsA;
+    return String(a?.team_name || "").localeCompare(String(b?.team_name || ""), "ru");
   });
   return arr;
 }
@@ -3675,6 +3716,46 @@ async function fetchOperatorsRating({ metric, scope, limit = OPERATOR_RATING_LIM
   };
 }
 
+async function fetchTeamsRating({ scope, limit = OPERATOR_RATING_LIMIT }) {
+  const normalizedScope = normalizeTeamRatingScope(scope);
+  const base = await getProfileStatsApiBase();
+  if (!base) {
+    throw new Error("Сервер недоступен");
+  }
+  const params = new URLSearchParams();
+  params.set("scope", normalizedScope);
+  params.set("limit", String(Math.max(1, Number(limit) || OPERATOR_RATING_LIMIT)));
+  const dayKey = getRatingDayKeyKyiv();
+  if (normalizedScope === "shift") {
+    params.set("day_key", dayKey);
+  }
+  const url = `${base}${TEAM_RATING_ENDPOINT}?${params.toString()}`;
+  let response;
+  try {
+    response = await fetch(url, {
+      method: "GET",
+      headers: withExtensionVersionHeader(),
+    });
+  } catch {
+    throw new Error("Сервер недоступен");
+  }
+  if (!response?.ok) {
+    throw new Error(`HTTP ${response?.status || 0}`);
+  }
+  const payload = await response.json().catch(() => null);
+  if (!payload || payload.ok !== true) {
+    throw new Error("invalid_payload");
+  }
+  const items = sortTeamRatingItems(payload.items).slice(0, OPERATOR_RATING_LIMIT);
+  return {
+    kind: "teams",
+    scope: normalizedScope,
+    dayKey: normalizedScope === "shift" ? dayKey : "all",
+    updatedAt: Number(payload.updated_at) || Date.now(),
+    items,
+  };
+}
+
 async function getOperatorsRatingCached({ metric, scope, force = false }) {
   const normalizedMetric = normalizeRatingMetric(metric);
   const normalizedScope = normalizeRatingScope(scope);
@@ -3696,6 +3777,39 @@ async function getOperatorsRatingCached({ metric, scope, force = false }) {
   const requestPromise = (async () => {
     const next = await fetchOperatorsRating({
       metric: normalizedMetric,
+      scope: normalizedScope,
+      limit: OPERATOR_RATING_LIMIT,
+    });
+    const entry = {
+      ...next,
+      expiresAt: Date.now() + OPERATOR_RATING_CACHE_TTL_MS,
+    };
+    operatorRatingState.cache.set(key, entry);
+    return entry;
+  })();
+  operatorRatingState.inFlight.set(key, requestPromise);
+  try {
+    return await requestPromise;
+  } finally {
+    operatorRatingState.inFlight.delete(key);
+  }
+}
+
+async function getTeamsRatingCached({ scope, force = false }) {
+  const normalizedScope = normalizeTeamRatingScope(scope);
+  const dayKey = normalizedScope === "shift" ? getRatingDayKeyKyiv() : "all";
+  const key = getTeamRatingCacheKey({ scope: normalizedScope, dayKey });
+  const now = Date.now();
+  const cached = operatorRatingState.cache.get(key);
+  if (!force && cached && Number(cached.expiresAt) > now) {
+    return cached;
+  }
+  const inFlight = operatorRatingState.inFlight.get(key);
+  if (inFlight) {
+    return inFlight;
+  }
+  const requestPromise = (async () => {
+    const next = await fetchTeamsRating({
       scope: normalizedScope,
       limit: OPERATOR_RATING_LIMIT,
     });
@@ -3736,6 +3850,10 @@ function getOperatorRatingCurrentOperatorId() {
 function createOperatorRatingPanelDom() {
   const root = document.createElement("div");
   root.className = "rating-panel";
+  const headerRow = document.createElement("div");
+  headerRow.className = "rating-header-row";
+  const tabsWrap = document.createElement("div");
+  tabsWrap.className = "rating-tabs-wrap";
   const mainTabs = document.createElement("div");
   mainTabs.className = "rating-main-tabs";
   const tabShiftBalance = document.createElement("button");
@@ -3765,16 +3883,34 @@ function createOperatorRatingPanelDom() {
   subActions.dataset.subTab = "actions";
   subTabs.appendChild(subBalance);
   subTabs.appendChild(subActions);
+  const toggleTeams = document.createElement("button");
+  toggleTeams.type = "button";
+  toggleTeams.className = "rating-teams-toggle";
+  const toggleTeamsIcon = document.createElement("span");
+  toggleTeamsIcon.className = "rating-teams-toggle-icon";
+  toggleTeamsIcon.textContent = "⬅️";
+  toggleTeams.appendChild(toggleTeamsIcon);
+  const teamsModeButton = document.createElement("button");
+  teamsModeButton.type = "button";
+  teamsModeButton.className = "rating-teams-mode-button";
+  mainTabs.insertBefore(teamsModeButton, mainTabs.firstChild);
+  headerRow.appendChild(toggleTeams);
+  tabsWrap.appendChild(mainTabs);
+  tabsWrap.appendChild(subTabs);
+  headerRow.appendChild(tabsWrap);
   const tableWrap = document.createElement("div");
   tableWrap.className = "rating-table-wrap";
   const updated = document.createElement("div");
   updated.className = "rating-updated-at";
-  root.appendChild(mainTabs);
-  root.appendChild(subTabs);
+  root.appendChild(headerRow);
   root.appendChild(tableWrap);
   root.appendChild(updated);
   return {
     root,
+    headerRow,
+    toggleTeams,
+    toggleTeamsIcon,
+    teamsModeButton,
     mainTabs: {
       shiftBalance: tabShiftBalance,
       shiftActions: tabShiftActions,
@@ -3796,8 +3932,14 @@ function updateOperatorRatingPanelTexts(panelDom) {
   panelDom.mainTabs.shiftActions.textContent =
     t("ratingMainShiftActions") || "Действия за смену";
   panelDom.mainTabs.allTime.textContent = t("ratingTabAllTime") || "За всё время";
+  panelDom.teamsModeButton.textContent = t("ratingMainTeams") || "Команды";
   panelDom.subTabs.balance.textContent = t("ratingTitleBalance") || "Балансы";
   panelDom.subTabs.actions.textContent = t("ratingTitleActions") || "Действия";
+  const toggleLabel = operatorRatingState.teamsPanelExpanded
+    ? t("ratingCollapsePanel") || "Свернуть"
+    : t("ratingExpandPanel") || "Развернуть";
+  panelDom.toggleTeams.title = toggleLabel;
+  panelDom.toggleTeams.setAttribute("aria-label", toggleLabel);
 }
 
 function getMsUntilNextKyivHourBoundary() {
@@ -3842,34 +3984,114 @@ function switchOperatorRatingAllTimeSubTab(nextSubTab) {
   renderOperatorRatingTables({ force: false }).catch(() => {});
 }
 
+function toggleOperatorRatingTeamsPanel(forceOpen) {
+  const nextOpen =
+    typeof forceOpen === "boolean" ? forceOpen : !operatorRatingState.teamsPanelExpanded;
+  operatorRatingState.teamsPanelExpanded = !!nextOpen;
+  renderOperatorRatingPanelState({
+    panelDom: operatorRatingPanelDom,
+    loading: !!operatorRatingState.lastLoading,
+    error: !!operatorRatingState.lastError,
+    payload: operatorRatingState.lastPayload,
+    metric: operatorRatingState.lastMetric,
+    scope: operatorRatingState.lastScope,
+  });
+}
+
 function buildRatingTableRows({ metric, scope, items }) {
+  if (metric === "teams") {
+    const showExpanded = !!operatorRatingState.teamsPanelExpanded;
+    const rows = [];
+    const header = document.createElement("div");
+    header.className = `rating-row rating-row-header ${showExpanded ? "rating-row-team-expanded" : "rating-row-team-collapsed"}`;
+    header.innerHTML = showExpanded
+      ? `
+    <span>${escapeHtml(t("ratingColRank") || "#")}</span>
+    <span>${escapeHtml(t("ratingColTeam") || "Команда")}</span>
+    <span>${escapeHtml(t("ratingColChat") || "Чаты")}</span>
+    <span>${escapeHtml(t("ratingColMail") || "Письма")}</span>
+    <span>${escapeHtml(t("ratingTitleActions") || "Действия")}</span>
+    <span>${escapeHtml(t("ratingColValue") || "Баланс")}</span>
+  `.trim()
+      : `
+    <span>${escapeHtml(t("ratingColRank") || "#")}</span>
+    <span>${escapeHtml(t("ratingColTeam") || "Команда")}</span>
+    <span>${escapeHtml(t("ratingTitleActions") || "Действия")}</span>
+    <span>${escapeHtml(t("ratingColValue") || "Баланс")}</span>
+  `.trim();
+    rows.push(header);
+    (Array.isArray(items) ? items : []).forEach((item, index) => {
+      const teamName = String(item?.team_name || "").trim() || "—";
+      const balance = (Number(item?.balance_total) || 0).toFixed(2);
+      const actions = String(Math.max(0, Number(item?.actions_total) || 0));
+      const chat = String(Math.max(0, Number(item?.chat_count) || 0));
+      const mail = String(Math.max(0, Number(item?.mail_count) || 0));
+      const row = document.createElement("div");
+      row.className = `rating-row ${showExpanded ? "rating-row-team-expanded" : "rating-row-team-collapsed"}`;
+      row.innerHTML = showExpanded
+        ? `
+        <span>${index + 1}</span>
+        <span title="${escapeHtml(teamName)}">${escapeHtml(teamName)}</span>
+        <span>${escapeHtml(chat)}</span>
+        <span>${escapeHtml(mail)}</span>
+        <span>${escapeHtml(actions)}</span>
+        <span>${escapeHtml(balance)}</span>
+      `.trim()
+        : `
+        <span>${index + 1}</span>
+        <span title="${escapeHtml(teamName)}">${escapeHtml(teamName)}</span>
+        <span>${escapeHtml(actions)}</span>
+        <span>${escapeHtml(balance)}</span>
+      `.trim();
+      rows.push(row);
+    });
+    return rows;
+  }
   const normalizedMetric = normalizeRatingMetric(metric);
   const normalizedScope = normalizeRatingScope(scope);
   const isBalance = normalizedMetric === "balance";
   const showActionColumns = !isBalance;
+  const showTeamsColumn = !!operatorRatingState.teamsPanelExpanded;
   const rows = [];
   const currentOperatorId = getOperatorRatingCurrentOperatorId();
   const header = document.createElement("div");
   header.className = `rating-row rating-row-header ${isBalance ? "rating-row-balance" : "rating-row-actions"}`;
-  header.innerHTML = isBalance
-    ? `
+  if (isBalance) {
+    header.innerHTML = showTeamsColumn
+      ? `
+    <span>${escapeHtml(t("ratingColRank") || "#")}</span>
+    <span>${escapeHtml(t("ratingColName") || "Имя")}</span>
+    <span>${escapeHtml(t("ratingTeamTitle") || "Команда")}</span>
+    <span>${escapeHtml(t("ratingColValue") || "Баланс")}</span>
+  `.trim()
+      : `
     <span>${escapeHtml(t("ratingColRank") || "#")}</span>
     <span>${escapeHtml(t("ratingColName") || "Имя")}</span>
     <span>${escapeHtml(t("ratingColValue") || "Баланс")}</span>
+  `.trim();
+  } else {
+    header.innerHTML = showTeamsColumn
+      ? `
+    <span>${escapeHtml(t("ratingColRank") || "#")}</span>
+    <span>${escapeHtml(t("ratingColName") || "Имя")}</span>
+    <span>${escapeHtml(t("ratingTeamTitle") || "Команда")}</span>
+    <span>${escapeHtml(t("ratingColChat") || "Чаты")}</span>
+    <span>${escapeHtml(t("ratingColMail") || "Письма")}</span>
+    <span>${escapeHtml(t("ratingColTotal") || "Всего")}</span>
   `.trim()
-    : `
+      : `
     <span>${escapeHtml(t("ratingColRank") || "#")}</span>
     <span>${escapeHtml(t("ratingColName") || "Имя")}</span>
     <span>${escapeHtml(t("ratingColChat") || "Чаты")}</span>
     <span>${escapeHtml(t("ratingColMail") || "Письма")}</span>
     <span>${escapeHtml(t("ratingColTotal") || "Всего")}</span>
   `.trim();
+  }
   rows.push(header);
   items.forEach((item, index) => {
     const operatorId = normalizeOperatorIdString(item?.operator_id);
     const operatorName = String(item?.operator_name || "").trim() || `ID ${operatorId || "—"}`;
-    const teamName = String(item?.team_name || "").trim();
-    const operatorLabel = teamName ? `${operatorName} • ${teamName}` : operatorName;
+    const teamName = String(item?.team_name || "").trim() || "—";
     const valueRaw = Number(item?.value) || 0;
     const value = valueRaw.toFixed(2);
     const chat = String(Math.max(0, Number(item?.chat_count) || 0));
@@ -3886,15 +4108,31 @@ function buildRatingTableRows({ metric, scope, items }) {
       row.classList.add("is-current");
     }
     if (isBalance) {
-      row.innerHTML = `
+      row.innerHTML = showTeamsColumn
+        ? `
         <span>${index + 1}</span>
-        <span title="${escapeHtml(operatorLabel)}">${escapeHtml(operatorLabel)}</span>
+        <span title="${escapeHtml(operatorName)}">${escapeHtml(operatorName)}</span>
+        <span title="${escapeHtml(teamName)}">${escapeHtml(teamName)}</span>
+        <span>${escapeHtml(value)}</span>
+      `.trim()
+        : `
+        <span>${index + 1}</span>
+        <span title="${escapeHtml(operatorName)}">${escapeHtml(operatorName)}</span>
         <span>${escapeHtml(value)}</span>
       `.trim();
     } else {
-      row.innerHTML = `
+      row.innerHTML = showTeamsColumn
+        ? `
         <span>${index + 1}</span>
-        <span title="${escapeHtml(operatorLabel)}">${escapeHtml(operatorLabel)}</span>
+        <span title="${escapeHtml(operatorName)}">${escapeHtml(operatorName)}</span>
+        <span title="${escapeHtml(teamName)}">${escapeHtml(teamName)}</span>
+        <span>${escapeHtml(chat)}</span>
+        <span>${escapeHtml(mail)}</span>
+        <span>${escapeHtml(total)}</span>
+      `.trim()
+        : `
+        <span>${index + 1}</span>
+        <span title="${escapeHtml(operatorName)}">${escapeHtml(operatorName)}</span>
         <span>${escapeHtml(chat)}</span>
         <span>${escapeHtml(mail)}</span>
         <span>${escapeHtml(total)}</span>
@@ -3910,16 +4148,26 @@ function buildRatingTableRows({ metric, scope, items }) {
 
 function renderOperatorRatingPanelState({ panelDom, loading, error, payload, metric, scope }) {
   if (!panelDom) return;
+  operatorRatingState.lastLoading = !!loading;
+  operatorRatingState.lastError = !!error;
+  operatorRatingState.lastPayload = payload || null;
+  operatorRatingState.lastKind = metric === "teams" ? "teams" : "operators";
+  operatorRatingState.lastMetric =
+    metric === "teams" ? "teams" : normalizeRatingMetric(metric);
+  operatorRatingState.lastScope =
+    metric === "teams" ? normalizeTeamRatingScope(scope) : normalizeRatingScope(scope);
   const activeMainTab = normalizeRatingMainTab(operatorRatingState.activeMainTab);
   const activeSubTab = normalizeRatingAllTimeSubTab(operatorRatingState.activeAllTimeSubTab);
   updateOperatorRatingPanelTexts(panelDom);
   panelDom.mainTabs.shiftBalance.classList.toggle("active", activeMainTab === "shift_balance");
   panelDom.mainTabs.shiftActions.classList.toggle("active", activeMainTab === "shift_actions");
   panelDom.mainTabs.allTime.classList.toggle("active", activeMainTab === "all_time");
+  panelDom.teamsModeButton.classList.toggle("active", activeMainTab === "teams");
   const showSubTabs = activeMainTab === "all_time";
-  panelDom.subTabs.balance.classList.toggle("active", activeSubTab === "balance");
-  panelDom.subTabs.actions.classList.toggle("active", activeSubTab === "actions");
+  panelDom.subTabs.balance.classList.toggle("active", activeMainTab === "all_time" && activeSubTab === "balance");
+  panelDom.subTabs.actions.classList.toggle("active", activeMainTab === "all_time" && activeSubTab === "actions");
   panelDom.root.classList.toggle("show-all-time-subtabs", showSubTabs);
+  panelDom.root.classList.toggle("teams-panel-open", !!operatorRatingState.teamsPanelExpanded);
   panelDom.tableWrap.innerHTML = "";
   if (loading) {
     const node = document.createElement("div");
@@ -3965,21 +4213,27 @@ async function renderOperatorRatingPanel({ force = false }) {
     loading: true,
     error: false,
     payload: null,
-    metric: query.metric,
+    metric: query.kind === "teams" ? "teams" : query.metric,
     scope: query.scope,
   });
   try {
-    const payload = await getOperatorsRatingCached({
-      metric: query.metric,
-      scope: query.scope,
-      force,
-    });
+    const payload =
+      query.kind === "teams"
+        ? await getTeamsRatingCached({
+            scope: query.scope,
+            force,
+          })
+        : await getOperatorsRatingCached({
+            metric: query.metric,
+            scope: query.scope,
+            force,
+          });
     renderOperatorRatingPanelState({
       panelDom: operatorRatingPanelDom,
       loading: false,
       error: false,
       payload,
-      metric: query.metric,
+      metric: query.kind === "teams" ? "teams" : query.metric,
       scope: query.scope,
     });
   } catch {
@@ -3988,7 +4242,7 @@ async function renderOperatorRatingPanel({ force = false }) {
       loading: false,
       error: true,
       payload: null,
-      metric: query.metric,
+      metric: query.kind === "teams" ? "teams" : query.metric,
       scope: query.scope,
     });
   }
@@ -4010,6 +4264,9 @@ function initOperatorRatingPanel(chartCol) {
   chartCol.appendChild(root);
   operatorRatingPanelRoot = root;
   operatorRatingPanelDom = panelDom;
+  panelDom.toggleTeams.addEventListener("click", () => {
+    toggleOperatorRatingTeamsPanel();
+  });
   panelDom.mainTabs.shiftBalance.addEventListener("click", () => {
     switchOperatorRatingMainTab("shift_balance");
   });
@@ -4018,6 +4275,9 @@ function initOperatorRatingPanel(chartCol) {
   });
   panelDom.mainTabs.allTime.addEventListener("click", () => {
     switchOperatorRatingMainTab("all_time");
+  });
+  panelDom.teamsModeButton.addEventListener("click", () => {
+    switchOperatorRatingMainTab("teams");
   });
   panelDom.subTabs.balance.addEventListener("click", () => {
     switchOperatorRatingAllTimeSubTab("balance");
@@ -5316,11 +5576,18 @@ let operatorRatingPanelRoot = null;
 let operatorRatingHourlyTimerId = null;
 let operatorRatingPanelDom = null;
 const operatorRatingState = {
-  activeMainTab: "shift_balance",
+  activeMainTab: "teams",
   activeAllTimeSubTab: "balance",
   cache: new Map(),
   inFlight: new Map(),
   lastRenderAt: 0,
+  teamsPanelExpanded: false,
+  lastLoading: false,
+  lastError: false,
+  lastPayload: null,
+  lastKind: "operators",
+  lastMetric: "balance",
+  lastScope: "shift",
 };
 
 function injectProfileSwitchInlineStyles() {
@@ -6034,7 +6301,8 @@ async function loadOperatorShiftSnapshotQueue() {
     const store = await getStore([OPERATOR_SHIFT_SNAPSHOT_QUEUE_KEY]);
     const cached = store[OPERATOR_SHIFT_SNAPSHOT_QUEUE_KEY];
     if (Array.isArray(cached)) {
-      operatorShiftSnapshotQueue = cached.filter(Boolean);
+      operatorShiftSnapshotQueue = normalizeOperatorShiftSnapshotQueue(cached);
+      persistOperatorShiftSnapshotQueue();
     }
   } catch {}
 }
@@ -6043,6 +6311,78 @@ function persistOperatorShiftSnapshotQueue() {
   try {
     setStore({ [OPERATOR_SHIFT_SNAPSHOT_QUEUE_KEY]: operatorShiftSnapshotQueue });
   } catch {}
+}
+
+function normalizeOperatorShiftSnapshotEntry(entry) {
+  if (!entry || typeof entry !== "object") return null;
+  const dayKey = String(entry.day_key || "").trim();
+  const operatorId = String(entry.operator_id || "").trim();
+  if (!dayKey || !operatorId) return null;
+  const updatedAt = Number(entry.updated_at || 0) || Date.now();
+  const normalizedHourStart =
+    Number(entry.hour_start) || (Number.isFinite(updatedAt) ? updatedAt - (updatedAt % (60 * 60 * 1000)) : 0);
+  return {
+    day_key: dayKey,
+    operator_id: operatorId,
+    operator_name: String(entry.operator_name || "").trim(),
+    balance_total: Number(entry.balance_total) || 0,
+    actions_total: Math.max(0, Math.round(Number(entry.actions_total) || 0)),
+    chat_count: Math.max(0, Math.round(Number(entry.chat_count) || 0)),
+    mail_count: Math.max(0, Math.round(Number(entry.mail_count) || 0)),
+    hour_actions_total: Math.max(0, Math.round(Number(entry.hour_actions_total) || 0)),
+    hour_chat_count: Math.max(0, Math.round(Number(entry.hour_chat_count) || 0)),
+    hour_mail_count: Math.max(0, Math.round(Number(entry.hour_mail_count) || 0)),
+    hour_start: normalizedHourStart || null,
+    updated_at: updatedAt,
+  };
+}
+
+function getOperatorShiftSnapshotQueueKey(entry) {
+  const normalized = normalizeOperatorShiftSnapshotEntry(entry);
+  if (!normalized) return "";
+  return `${normalized.day_key}::${normalized.operator_id}::${Number(normalized.hour_start) || 0}`;
+}
+
+function normalizeOperatorShiftSnapshotQueue(entries) {
+  const merged = new Map();
+  (Array.isArray(entries) ? entries : []).forEach((entry) => {
+    const normalized = normalizeOperatorShiftSnapshotEntry(entry);
+    if (!normalized) return;
+    const key = getOperatorShiftSnapshotQueueKey(normalized);
+    if (!key) return;
+    const current = merged.get(key);
+    if (!current || Number(normalized.updated_at || 0) >= Number(current.updated_at || 0)) {
+      merged.set(key, normalized);
+    }
+  });
+  return Array.from(merged.values()).sort((a, b) => {
+    const dayDiff = String(a?.day_key || "").localeCompare(String(b?.day_key || ""));
+    if (dayDiff !== 0) return dayDiff;
+    const operatorDiff = String(a?.operator_id || "").localeCompare(String(b?.operator_id || ""));
+    if (operatorDiff !== 0) return operatorDiff;
+    const hourDiff = Number(a?.hour_start || 0) - Number(b?.hour_start || 0);
+    if (hourDiff !== 0) return hourDiff;
+    const updatedDiff = Number(a?.updated_at || 0) - Number(b?.updated_at || 0);
+    if (updatedDiff !== 0) return updatedDiff;
+    return getOperatorShiftSnapshotQueueKey(a).localeCompare(getOperatorShiftSnapshotQueueKey(b));
+  });
+}
+
+function applyOperatorShiftSnapshotStateFromPayload(payload) {
+  if (!payload || typeof payload !== "object") return;
+  operatorShiftSnapshotState = {
+    dayKey: String(payload.day_key || ""),
+    operatorId: String(payload.operator_id || ""),
+    operator_name: String(payload.operator_name || ""),
+    balance_total: Number(payload.balance_total) || 0,
+    actions_total: Math.max(0, Math.round(Number(payload.actions_total) || 0)),
+    chat_count: Math.max(0, Math.round(Number(payload.chat_count) || 0)),
+    mail_count: Math.max(0, Math.round(Number(payload.mail_count) || 0)),
+    hour_actions_total: Math.max(0, Math.round(Number(payload.hour_actions_total) || 0)),
+    hour_chat_count: Math.max(0, Math.round(Number(payload.hour_chat_count) || 0)),
+    hour_mail_count: Math.max(0, Math.round(Number(payload.hour_mail_count) || 0)),
+    hour_start: Number(payload.hour_start) || 0,
+  };
 }
 
 async function loadOperatorNamesCache() {
@@ -6176,41 +6516,44 @@ function updateOperatorNameUI() {
 }
 
 function enqueueOperatorShiftSnapshot(entry) {
-  if (!entry) return;
-  const key = `${entry.day_key}::${entry.operator_id}`;
-  const merged = new Map();
-  operatorShiftSnapshotQueue.forEach((item) => {
-    if (!item) return;
-    const itemKey = `${item.day_key}::${item.operator_id}`;
-    merged.set(itemKey, item);
-  });
-  const current = merged.get(key);
-  if (!current || Number(entry.updated_at || 0) >= Number(current.updated_at || 0)) {
-    merged.set(key, entry);
-  }
-  operatorShiftSnapshotQueue = Array.from(merged.values());
+  const normalized = normalizeOperatorShiftSnapshotEntry(entry);
+  if (!normalized) return;
+  operatorShiftSnapshotQueue = normalizeOperatorShiftSnapshotQueue([
+    ...operatorShiftSnapshotQueue,
+    normalized,
+  ]);
   persistOperatorShiftSnapshotQueue();
 }
 
 async function flushOperatorShiftSnapshotQueue() {
   if (isUiBlockedByMissingOperatorId()) return;
   if (isAdminUniversalProfileContainerPresent()) return;
-  if (!operatorShiftSnapshotQueue.length) return;
+  if (!operatorShiftSnapshotQueue.length) return true;
   const base = await getProfileStatsApiBase();
-  if (!base) return;
-  const entry = operatorShiftSnapshotQueue[0];
-  try {
-    const res = await fetch(`${base}/operators/shift/snapshot`, {
-      method: "POST",
-      headers: withExtensionVersionHeader({ "Content-Type": "application/json" }),
-      body: JSON.stringify(entry),
-    });
-    if (!res.ok) return;
-    const data = await res.json().catch(() => ({}));
-    if (!data || data.ok !== true) return;
-    operatorShiftSnapshotQueue.shift();
-    persistOperatorShiftSnapshotQueue();
-  } catch {}
+  if (!base) return false;
+  while (operatorShiftSnapshotQueue.length) {
+    const entry = normalizeOperatorShiftSnapshotEntry(operatorShiftSnapshotQueue[0]);
+    if (!entry) {
+      operatorShiftSnapshotQueue.shift();
+      persistOperatorShiftSnapshotQueue();
+      continue;
+    }
+    try {
+      const res = await fetch(`${base}/operators/shift/snapshot`, {
+        method: "POST",
+        headers: withExtensionVersionHeader({ "Content-Type": "application/json" }),
+        body: JSON.stringify(entry),
+      });
+      if (!res.ok) return false;
+      const data = await res.json().catch(() => ({}));
+      if (!data || data.ok !== true) return false;
+      operatorShiftSnapshotQueue.shift();
+      persistOperatorShiftSnapshotQueue();
+    } catch {
+      return false;
+    }
+  }
+  return true;
 }
 
 async function fetchOperatorShiftSummary() {
@@ -6355,24 +6698,17 @@ async function sendOperatorShiftSnapshot(balanceTotal) {
   if (!base) {
     if (!isServerAccessLocked()) {
       enqueueOperatorShiftSnapshot(payload);
-      operatorShiftSnapshotState = {
-        dayKey,
-        operatorId: String(operatorId),
-        operator_name: operatorName,
-        balance_total: balance,
-        actions_total: actionsTotal,
-        chat_count: chat,
-        mail_count: mail,
-        hour_actions_total: hourActionsTotal,
-        hour_chat_count: hourChat,
-        hour_mail_count: hourMail,
-        hour_start: hourStart,
-      };
+      applyOperatorShiftSnapshotStateFromPayload(payload);
     }
     return;
   }
   try {
-    await flushOperatorShiftSnapshotQueue();
+    const queueFlushed = await flushOperatorShiftSnapshotQueue();
+    if (!queueFlushed) {
+      enqueueOperatorShiftSnapshot(payload);
+      applyOperatorShiftSnapshotStateFromPayload(payload);
+      return;
+    }
     const res = await fetch(`${base}/operators/shift/snapshot`, {
       method: "POST",
       headers: withExtensionVersionHeader({ "Content-Type": "application/json" }),
@@ -6380,28 +6716,19 @@ async function sendOperatorShiftSnapshot(balanceTotal) {
     });
     if (!res.ok) {
       enqueueOperatorShiftSnapshot(payload);
+      applyOperatorShiftSnapshotStateFromPayload(payload);
       return;
     }
     const data = await res.json().catch(() => ({}));
     if (!data || data.ok !== true) {
       enqueueOperatorShiftSnapshot(payload);
+      applyOperatorShiftSnapshotStateFromPayload(payload);
       return;
     }
-    operatorShiftSnapshotState = {
-      dayKey,
-      operatorId: String(operatorId),
-      operator_name: operatorName,
-      balance_total: balance,
-      actions_total: actionsTotal,
-      chat_count: chat,
-      mail_count: mail,
-      hour_actions_total: hourActionsTotal,
-      hour_chat_count: hourChat,
-      hour_mail_count: hourMail,
-      hour_start: hourStart,
-    };
+    applyOperatorShiftSnapshotStateFromPayload(payload);
   } catch {
     enqueueOperatorShiftSnapshot(payload);
+    applyOperatorShiftSnapshotStateFromPayload(payload);
   }
 }
 
@@ -8295,6 +8622,7 @@ function injectLogoWhiteSquareStyles() {
         border-radius:8px;
         margin-right:10px;
         min-height:0;
+        min-width:0;
         height:100%;
       }
       .${LOGO_WHITE_SQUARE_EXPANDED_CLASS} .${LOGO_WHITE_SQUARE_MENU_CLASS} .menu-column.menu-column-left{
@@ -8309,7 +8637,7 @@ function injectLogoWhiteSquareStyles() {
         padding:0;
         margin-right:0;
         position:relative;
-        overflow:hidden;
+        overflow:visible;
       }
       .${LOGO_WHITE_SQUARE_EXPANDED_CLASS} .${LOGO_WHITE_SQUARE_MENU_CLASS} .menu-column.menu-column-chart::before{
         content:none;
@@ -8325,6 +8653,8 @@ function injectLogoWhiteSquareStyles() {
         min-height:0;
       }
       .${LOGO_WHITE_SQUARE_MENU_CLASS} .rating-panel{
+        --rating-teams-width:min(280px, 30vw);
+        --rating-teams-gap:10px;
         display:flex;
         flex-direction:column;
         gap:8px;
@@ -8334,11 +8664,80 @@ function injectLogoWhiteSquareStyles() {
         padding:10px;
         min-height:0;
         flex:1 1 auto;
+        position:relative;
+        overflow:visible;
+        width:100%;
+        margin-left:0;
+        min-width:0;
+        box-sizing:border-box;
+        transition:width .18s ease, margin-left .18s ease;
+      }
+      .${LOGO_WHITE_SQUARE_MENU_CLASS} .rating-panel.teams-panel-open{
+        width:calc(100% + var(--rating-teams-width) + var(--rating-teams-gap));
+        margin-left:calc(-1 * (var(--rating-teams-width) + var(--rating-teams-gap)));
+      }
+      .${LOGO_WHITE_SQUARE_MENU_CLASS} .rating-header-row{
+        display:flex;
+        align-items:flex-start;
+        justify-content:flex-start;
+        gap:10px;
+        min-width:0;
+        box-sizing:border-box;
+      }
+      .${LOGO_WHITE_SQUARE_MENU_CLASS} .rating-tabs-wrap{
+        display:flex;
+        flex-direction:column;
+        gap:6px;
+        min-width:0;
+        flex:1 1 auto;
+        box-sizing:border-box;
+      }
+      .${LOGO_WHITE_SQUARE_MENU_CLASS} .rating-teams-toggle{
+        flex:0 0 32px;
+        border:1px solid rgba(31,79,116,0.18);
+        background:#f4f7fb;
+        color:#163656;
+        border-radius:4px;
+        width:32px;
+        height:32px;
+        padding:0;
+        display:inline-flex;
+        align-items:center;
+        justify-content:center;
+        cursor:pointer;
+        box-sizing:border-box;
+        white-space:nowrap;
+      }
+      .${LOGO_WHITE_SQUARE_MENU_CLASS} .rating-teams-toggle:hover{
+        background:#e8eff7;
+      }
+      .${LOGO_WHITE_SQUARE_MENU_CLASS} .rating-panel.teams-panel-open .rating-teams-toggle{
+        background:#1f4f74;
+        color:#fff;
+        border-color:#1f4f74;
+      }
+      .${LOGO_WHITE_SQUARE_MENU_CLASS} .rating-teams-toggle-icon{
+        display:inline-flex;
+        align-items:center;
+        justify-content:center;
+        width:100%;
+        height:100%;
+        font-size:16px;
+        line-height:1;
+        transform:rotate(0deg);
+        transform-origin:center;
+        transition:transform .2s ease;
+        pointer-events:none;
+      }
+      .${LOGO_WHITE_SQUARE_MENU_CLASS} .rating-panel.teams-panel-open .rating-teams-toggle-icon{
+        transform:rotate(180deg);
       }
       .${LOGO_WHITE_SQUARE_MENU_CLASS} .rating-main-tabs,
       .${LOGO_WHITE_SQUARE_MENU_CLASS} .rating-sub-tabs{
         display:flex;
         gap:6px;
+        min-width:0;
+        box-sizing:border-box;
       }
       .${LOGO_WHITE_SQUARE_MENU_CLASS} .rating-sub-tabs{
         display:none;
@@ -8347,7 +8746,8 @@ function injectLogoWhiteSquareStyles() {
         display:flex;
       }
       .${LOGO_WHITE_SQUARE_MENU_CLASS} .rating-main-tab,
-      .${LOGO_WHITE_SQUARE_MENU_CLASS} .rating-sub-tab{
+      .${LOGO_WHITE_SQUARE_MENU_CLASS} .rating-sub-tab,
+      .${LOGO_WHITE_SQUARE_MENU_CLASS} .rating-teams-mode-button{
         flex:1 1 0;
         border:1px solid rgba(31,79,116,0.18);
         background:#f4f7fb;
@@ -8357,9 +8757,15 @@ function injectLogoWhiteSquareStyles() {
         font-size:12px;
         font-weight:600;
         cursor:pointer;
+        min-width:0;
+        box-sizing:border-box;
+        overflow:hidden;
+        text-overflow:ellipsis;
+        white-space:nowrap;
       }
       .${LOGO_WHITE_SQUARE_MENU_CLASS} .rating-main-tab.active,
-      .${LOGO_WHITE_SQUARE_MENU_CLASS} .rating-sub-tab.active{
+      .${LOGO_WHITE_SQUARE_MENU_CLASS} .rating-sub-tab.active,
+      .${LOGO_WHITE_SQUARE_MENU_CLASS} .rating-teams-mode-button.active{
         background:#1f4f74;
         color:#fff;
         border-color:#1f4f74;
@@ -8369,30 +8775,70 @@ function injectLogoWhiteSquareStyles() {
         flex-direction:column;
         gap:4px;
         overflow:auto;
+        scrollbar-gutter:stable;
         min-height:0;
         flex:1 1 auto;
+        min-width:0;
+        box-sizing:border-box;
+        padding-right:10px;
+        padding-inline-end:10px;
       }
       .${LOGO_WHITE_SQUARE_MENU_CLASS} .rating-row{
         display:grid;
         align-items:center;
         gap:8px;
-        padding:4px 6px;
+        padding:4px 12px 4px 6px;
         border-radius:4px;
         font-size:11px;
         font-weight:600;
         color:#143852;
         background:#f9fbff;
+        min-width:0;
+        box-sizing:border-box;
       }
       .${LOGO_WHITE_SQUARE_MENU_CLASS} .rating-row.rating-row-balance{
-        grid-template-columns: 34px minmax(120px,1fr) 110px;
+        grid-template-columns:34px minmax(0,1fr) 84px;
       }
       .${LOGO_WHITE_SQUARE_MENU_CLASS} .rating-row.rating-row-actions{
-        grid-template-columns: 34px minmax(120px,1fr) 74px 74px 74px;
+        grid-template-columns:34px minmax(0,1fr) 56px 56px 64px;
+      }
+      .${LOGO_WHITE_SQUARE_MENU_CLASS} .rating-row.rating-row-team-collapsed{
+        grid-template-columns:34px minmax(0,1fr) 72px 84px;
+      }
+      .${LOGO_WHITE_SQUARE_MENU_CLASS} .rating-panel.teams-panel-open .rating-row.rating-row-balance{
+        grid-template-columns:34px minmax(0,1fr) minmax(180px,var(--rating-teams-width)) 84px;
+      }
+      .${LOGO_WHITE_SQUARE_MENU_CLASS} .rating-panel.teams-panel-open .rating-row.rating-row-actions{
+        grid-template-columns:34px minmax(0,1fr) minmax(180px,var(--rating-teams-width)) 56px 56px 64px;
+      }
+      .${LOGO_WHITE_SQUARE_MENU_CLASS} .rating-panel.teams-panel-open .rating-row.rating-row-team-expanded{
+        grid-template-columns:34px minmax(0,1fr) 56px 56px 72px 84px;
       }
       .${LOGO_WHITE_SQUARE_MENU_CLASS} .rating-row span{
         overflow:hidden;
         text-overflow:ellipsis;
         white-space:nowrap;
+        min-width:0;
+      }
+      .${LOGO_WHITE_SQUARE_MENU_CLASS} .rating-row.rating-row-balance > span:last-child{
+        justify-self:end;
+        text-align:right;
+      }
+      .${LOGO_WHITE_SQUARE_MENU_CLASS} .rating-panel:not(.teams-panel-open) .rating-row.rating-row-actions > span:nth-child(n+3){
+        justify-self:end;
+        text-align:right;
+      }
+      .${LOGO_WHITE_SQUARE_MENU_CLASS} .rating-panel.teams-panel-open .rating-row.rating-row-actions > span:nth-child(n+4){
+        justify-self:end;
+        text-align:right;
+      }
+      .${LOGO_WHITE_SQUARE_MENU_CLASS} .rating-row.rating-row-team-collapsed > span:nth-child(n+3){
+        justify-self:end;
+        text-align:right;
+      }
+      .${LOGO_WHITE_SQUARE_MENU_CLASS} .rating-panel.teams-panel-open .rating-row.rating-row-team-expanded > span:nth-child(n+3){
+        justify-self:end;
+        text-align:right;
       }
       .${LOGO_WHITE_SQUARE_MENU_CLASS} .rating-row.rating-row-header{
         align-items:center;
@@ -9579,7 +10025,7 @@ function getLogoWhiteSquareElement() {
       event.preventDefault();
       event.stopPropagation();
     } catch {}
-    window.open("https://t.me/+Ribzkm0dh8wxOWQ6", "_blank", "noopener");
+    window.open("https://t.me/B0TCHET_bot", "_blank", "noopener");
   });
   counter.appendChild(arrow);
   counter.appendChild(caption);
@@ -9960,6 +10406,7 @@ function closeLogoWhiteSquareExpandedPanel() {
   if (!logoWhiteSquareExpandedEl || !logoWhiteSquareExpandedOpen) return;
   clearOperatorRatingHourlyRefresh();
   logoWhiteSquareExpandedOpen = false;
+  operatorRatingState.teamsPanelExpanded = false;
   setLogoWhiteSquareArrowExpanded(false);
   logoWhiteSquareExpandedEl.classList.remove("open");
   logoWhiteSquareExpandedEl.setAttribute("aria-hidden", "true");
